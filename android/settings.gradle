@@ -1,0 +1,2 @@
+rootProject.name = "WinRMVPN"
+include ':app'
