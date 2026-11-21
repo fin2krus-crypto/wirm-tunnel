@@ -3,6 +3,7 @@ package mobile
 import (
 	"bufio"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -24,6 +25,11 @@ type SocketProtector interface {
 	Protect(fd int) bool
 }
 
+type TunnelCallback interface {
+	OnLog(msg string)
+	OnStateChanged(state string)
+}
+
 var (
 	mu         sync.Mutex
 	running    bool
@@ -31,7 +37,19 @@ var (
 	activeConn net.Conn
 )
 
-func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha256 string, protector SocketProtector) error {
+func emitLog(cb TunnelCallback, format string, args ...any) {
+	if cb != nil {
+		cb.OnLog(fmt.Sprintf(format, args...))
+	}
+}
+
+func emitState(cb TunnelCallback, state string) {
+	if cb != nil {
+		cb.OnStateChanged(state)
+	}
+}
+
+func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha256 string, protector SocketProtector, cb TunnelCallback) error {
 	mu.Lock()
 	if running {
 		mu.Unlock()
@@ -46,6 +64,8 @@ func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha2
 	go func() {
 		dupFd, err := syscall.Dup(tunFd)
 		if err != nil {
+			emitLog(cb, "[ERR] syscall.Dup(tunFd) failed: %v", err)
+			emitState(cb, "ERROR")
 			return
 		}
 		tunFile := os.NewFile(uintptr(dupFd), "tun")
@@ -54,16 +74,24 @@ func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha2
 		for {
 			select {
 			case <-stopChan:
+				emitState(cb, "DISCONNECTED")
 				return
 			default:
 			}
 
-			_ = runSingleSession(tunFile, serverAddr, psk, expectedPin, protector)
+			emitState(cb, "CONNECTING")
+			err := runSingleSession(tunFile, serverAddr, psk, expectedPin, protector, cb)
+			if err != nil {
+				emitLog(cb, "[ERR] Session ended: %v", err)
+				emitState(cb, "ERROR")
+			}
 
 			select {
 			case <-stopChan:
+				emitState(cb, "DISCONNECTED")
 				return
-			case <-time.After(2 * time.Second):
+			case <-time.After(3 * time.Second):
+				emitLog(cb, "[SYS] Reconnecting in 3s...")
 			}
 		}
 	}()
@@ -84,7 +112,9 @@ func StopWinRMTunnel() {
 	}
 }
 
-func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, protector SocketProtector) error {
+func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, protector SocketProtector, cb TunnelCallback) error {
+	emitLog(cb, "[TCP] Dialing %s (IPv4)...", serverAddr)
+
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -100,34 +130,46 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	rawConn, err := dialer.Dial("tcp4", serverAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("TCP connect failed: %w", err)
 	}
 	defer rawConn.Close()
+	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
 
+	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
 	uCfg := &utls.Config{
 		InsecureSkipVerify: true,
 	}
 	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
 	if err := uConn.ApplyPreset(buildAnsibleLinuxOpenSSL3Spec()); err != nil {
-		return err
+		return fmt.Errorf("uTLS preset error: %w", err)
 	}
 	if err := uConn.Handshake(); err != nil {
-		return err
+		return fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
 	state := uConn.ConnectionState()
+	emitLog(cb, "[TLS] Handshake OK (Version: 0x%x, Cipher: %s)", state.Version, tls.CipherSuiteName(state.CipherSuite))
+
 	if len(state.PeerCertificates) == 0 {
-		return errors.New("no server certificate")
+		return errors.New("server provided no certificate")
 	}
 	h := sha256.Sum256(state.PeerCertificates[0].Raw)
 	gotPin := hex.EncodeToString(h[:])
-	if expectedPin != "" && gotPin != expectedPin {
-		return fmt.Errorf("cert pin mismatch: got %s", gotPin)
+	emitLog(cb, "[TLS] Server Cert CN=%s, SHA-256=%s...", state.PeerCertificates[0].Subject.CommonName, gotPin[:16])
+
+	if expectedPin != "" {
+		if gotPin != expectedPin {
+			return fmt.Errorf("Certificate Pin mismatch! Expected %s..., got %s...", expectedPin[:12], gotPin[:12])
+		}
+		emitLog(cb, "[TLS] Certificate Pin verified OK")
+	} else {
+		emitLog(cb, "[TLS] Pinning skipped (empty pin field)")
 	}
 
 	br := bufio.NewReader(uConn)
 
-	// Шаг 1: Запрос Ansible pywinrm (python-requests + requests-ntlm) с NTLM Type 1
+	// Шаг 1: NTLM Type 1
+	emitLog(cb, "[HTTP] -> POST %s (NTLM Type 1)", common.WinRMPath)
 	t1 := common.BuildNTLMType1()
 	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
@@ -141,32 +183,40 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t1)
 
 	if _, err := io.WriteString(uConn, req1); err != nil {
-		return err
+		return fmt.Errorf("HTTP step 1 write failed: %w", err)
 	}
 
 	resp1, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("HTTP step 1 read failed: %w", err)
 	}
 	_, _ = io.Copy(io.Discard, resp1.Body)
 	_ = resp1.Body.Close()
 
+	emitLog(cb, "[HTTP] <- %s (Server: %s)", resp1.Status, resp1.Header.Get("Server"))
 	if resp1.StatusCode != 401 {
-		return fmt.Errorf("expected 401 on step 1, got %d", resp1.StatusCode)
+		return fmt.Errorf("expected 401 Unauthorized on step 1, got %d", resp1.StatusCode)
 	}
 
 	var serverChallenge [8]byte
+	foundChallenge := false
 	for _, hdr := range resp1.Header.Values("WWW-Authenticate") {
 		if strings.HasPrefix(hdr, "Negotiate ") {
 			b64 := strings.TrimSpace(strings.TrimPrefix(hdr, "Negotiate "))
 			raw, err := base64.StdEncoding.DecodeString(b64)
 			if err == nil && len(raw) >= 32 {
 				copy(serverChallenge[:], raw[24:32])
+				foundChallenge = true
 			}
 		}
 	}
+	if !foundChallenge {
+		return errors.New("server did not return NTLM Type 2 Challenge")
+	}
+	emitLog(cb, "[NTLM] Received Type 2 Challenge: %s", hex.EncodeToString(serverChallenge[:]))
 
-	// Шаг 2: Запрос Ansible pywinrm с NTLM Type 3 (скрытый HMAC) и телом SOAP Create Shell
+	// Шаг 2: NTLM Type 3 со скрытым HMAC + SOAP Create Shell
+	emitLog(cb, "[HTTP] -> POST %s (NTLM Type 3 + Covert HMAC + SOAP)", common.WinRMPath)
 	t3 := common.BuildNTLMType3WithAuth(psk, serverChallenge)
 	soapBody := common.FakeSoapCreateShellXML
 	req2 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
@@ -181,15 +231,16 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t3, len(soapBody), soapBody)
 
 	if _, err := io.WriteString(uConn, req2); err != nil {
-		return err
+		return fmt.Errorf("HTTP step 2 write failed: %w", err)
 	}
 
 	resp2, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("HTTP step 2 read failed: %w", err)
 	}
+	emitLog(cb, "[HTTP] <- %s", resp2.Status)
 	if resp2.StatusCode != 200 {
-		return fmt.Errorf("auth rejected with status %d", resp2.StatusCode)
+		return fmt.Errorf("auth rejected (%d) — проверьте PSK или системное время!", resp2.StatusCode)
 	}
 	if resp2.ContentLength > 0 {
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
@@ -199,6 +250,9 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	activeConn = uConn
 	mu.Unlock()
 
+	emitLog(cb, "[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
+	emitState(cb, "CONNECTED")
+
 	errCh := make(chan error, 2)
 
 	go func() {
@@ -206,12 +260,12 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		for {
 			n, err := tunFile.Read(buf)
 			if err != nil {
-				errCh <- err
+				errCh <- fmt.Errorf("TUN read error: %w", err)
 				return
 			}
 			if n >= 20 && (buf[0]>>4) == 4 {
 				if err := common.WritePaddedFrame(uConn, buf[:n]); err != nil {
-					errCh <- err
+					errCh <- fmt.Errorf("tunnel write error: %w", err)
 					return
 				}
 			}
@@ -223,12 +277,12 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		for {
 			pkt, err := common.ReadPaddedFrame(br, scratch)
 			if err != nil {
-				errCh <- err
+				errCh <- fmt.Errorf("tunnel read error: %w", err)
 				return
 			}
 			if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
 				if _, err := tunFile.Write(pkt); err != nil {
-					errCh <- err
+					errCh <- fmt.Errorf("TUN write error: %w", err)
 					return
 				}
 			}
@@ -237,17 +291,13 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	select {
 	case <-stopChan:
+		emitLog(cb, "[VPN] Stopped by user.")
 		return nil
 	case err := <-errCh:
 		return err
 	}
 }
 
-// buildAnsibleLinuxOpenSSL3Spec формирует TLS ClientHello от Linux OpenSSL 3.x (Ubuntu/Debian Python requests/pywinrm):
-// - 100% консистентность с Linux TCP-стеком Android (TTL=64, Timestamps=1) -> отсутствие Cross-Layer Mismatch
-// - Без SNI (подключение по IPv4-адресу)
-// - Без GREASE
-// - Без ALPN h2 (urllib3 в pywinrm использует только HTTP/1.1)
 func buildAnsibleLinuxOpenSSL3Spec() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
