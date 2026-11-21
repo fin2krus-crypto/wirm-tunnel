@@ -288,7 +288,7 @@ func buildAnsibleLinuxOpenSSL3Spec() *utls.ClientHelloSpec {
 				utls.CurveP384,
 			}},
 			&utls.SessionTicketExtension{},
-			&utls.UtlsEncryptThenMACExtension{},
+			&utls.GenericExtension{Id: 22}, // encrypt_then_mac (RFC 7366)
 			&utls.UtlsExtendedMasterSecretExtension{},
 			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
 				utls.ECDSAWithP256AndSHA256,
