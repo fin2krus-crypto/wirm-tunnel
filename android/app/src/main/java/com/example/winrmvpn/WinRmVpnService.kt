@@ -29,7 +29,7 @@ class WinRmVpnService : VpnService(), SocketProtector {
 
         if (vpnInterface == null) {
             val builder = Builder()
-                .setSession("WinRM-HTTPS")
+                .setSession("Ansible-WinRM")
                 .setMtu(1380)
                 .addAddress("10.88.0.2", 24)
                 .addRoute("0.0.0.0", 0)
@@ -77,14 +77,14 @@ class WinRmVpnService : VpnService(), SocketProtector {
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("WinRM HTTPS Tunnel")
-                .setContentText("Active on port 5986/TCP")
+                .setContentTitle("Ansible WinRM Tunnel")
+                .setContentText("OpenSSL 3.x -> WinRM 5986/TCP")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("WinRM HTTPS Tunnel")
+                .setContentTitle("Ansible WinRM Tunnel")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         }

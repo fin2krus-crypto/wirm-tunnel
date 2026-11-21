@@ -41,12 +41,12 @@ class MainActivity : Activity() {
             setText(prefs.getString("pin", ""))
         }
         statusText = TextView(this).apply {
-            text = "Status: Idle"
+            text = "Status: Idle (Profile: Ansible / Linux OpenSSL 3.x)"
             setPadding(0, 24, 0, 24)
         }
 
         val btnConnect = Button(this).apply {
-            text = "Connect (WinRM HTTPS)"
+            text = "Connect (Ansible WinRM HTTPS)"
             setOnClickListener {
                 prefs.edit()
                     .putString("server", serverInput.text.toString().trim())
@@ -96,7 +96,7 @@ class MainActivity : Activity() {
             } else {
                 startService(svc)
             }
-            statusText.text = "Status: Running (Schannel TLS -> 5986)"
+            statusText.text = "Status: Running (Ansible OpenSSL 3.x -> 5986)"
         }
     }
 }

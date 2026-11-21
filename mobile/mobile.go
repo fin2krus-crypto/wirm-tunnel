@@ -108,7 +108,7 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		InsecureSkipVerify: true,
 	}
 	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
-	if err := uConn.ApplyPreset(buildWindowsSchannelSpec()); err != nil {
+	if err := uConn.ApplyPreset(buildAnsibleLinuxOpenSSL3Spec()); err != nil {
 		return err
 	}
 	if err := uConn.Handshake(); err != nil {
@@ -127,15 +127,18 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	br := bufio.NewReader(uConn)
 
+	// Шаг 1: Запрос Ansible pywinrm (python-requests + requests-ntlm) с NTLM Type 1
 	t1 := common.BuildNTLMType1()
 	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
-		"Connection: Keep-Alive\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+		"Host: %s\r\n"+
 		"User-Agent: %s\r\n"+
+		"Accept-Encoding: gzip, deflate\r\n"+
+		"Accept: */*\r\n"+
+		"Connection: keep-alive\r\n"+
+		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
 		"Authorization: Negotiate %s\r\n"+
-		"Content-Length: 0\r\n"+
-		"Host: %s\r\n\r\n",
-		common.WinRMPath, common.WinRMUserAgent, t1, serverAddr)
+		"Content-Length: 0\r\n\r\n",
+		common.WinRMPath, serverAddr, common.WinRMUserAgent, t1)
 
 	if _, err := io.WriteString(uConn, req1); err != nil {
 		return err
@@ -163,16 +166,19 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		}
 	}
 
+	// Шаг 2: Запрос Ansible pywinrm с NTLM Type 3 (скрытый HMAC) и телом SOAP Create Shell
 	t3 := common.BuildNTLMType3WithAuth(psk, serverChallenge)
 	soapBody := common.FakeSoapCreateShellXML
 	req2 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
-		"Connection: Keep-Alive\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+		"Host: %s\r\n"+
 		"User-Agent: %s\r\n"+
+		"Accept-Encoding: gzip, deflate\r\n"+
+		"Accept: */*\r\n"+
+		"Connection: keep-alive\r\n"+
+		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
 		"Authorization: Negotiate %s\r\n"+
-		"Content-Length: %d\r\n"+
-		"Host: %s\r\n\r\n%s",
-		common.WinRMPath, common.WinRMUserAgent, t3, len(soapBody), serverAddr, soapBody)
+		"Content-Length: %d\r\n\r\n%s",
+		common.WinRMPath, serverAddr, common.WinRMUserAgent, t3, len(soapBody), soapBody)
 
 	if _, err := io.WriteString(uConn, req2); err != nil {
 		return err
@@ -237,25 +243,32 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	}
 }
 
-// Профиль Windows Server 2022/2025 Schannel при обращении по IP (без SNI, без GREASE, без ChaCha20, без ALPN h2)
-func buildWindowsSchannelSpec() *utls.ClientHelloSpec {
+// buildAnsibleLinuxOpenSSL3Spec формирует TLS ClientHello от Linux OpenSSL 3.x (Ubuntu/Debian Python requests/pywinrm):
+// - 100% консистентность с Linux TCP-стеком Android (TTL=64, Timestamps=1) -> отсутствие Cross-Layer Mismatch
+// - Без SNI (подключение по IPv4-адресу)
+// - Без GREASE
+// - Без ALPN h2 (urllib3 в pywinrm использует только HTTP/1.1)
+func buildAnsibleLinuxOpenSSL3Spec() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
 		TLSVersMax: utls.VersionTLS13,
 		CipherSuites: []uint16{
 			0x1302, // TLS_AES_256_GCM_SHA384
+			0x1303, // TLS_CHACHA20_POLY1305_SHA256
 			0x1301, // TLS_AES_128_GCM_SHA256
 			0xc02c, // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-			0xc02b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
 			0xc030, // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+			0xcca9, // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+			0xcca8, // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+			0xc02b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
 			0xc02f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 			0xc024, // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
-			0xc023, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
 			0xc028, // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384
+			0xc023, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
 			0xc027, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
 			0xc00a, // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
-			0xc009, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
 			0xc014, // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+			0xc009, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
 			0xc013, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
 			0x009d, // TLS_RSA_WITH_AES_256_GCM_SHA384
 			0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256
@@ -263,15 +276,20 @@ func buildWindowsSchannelSpec() *utls.ClientHelloSpec {
 			0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
 			0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
 			0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
+			0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
 		},
 		CompressionMethods: []uint8{0x00},
 		Extensions: []utls.TLSExtension{
+			&utls.SupportedPointsExtension{SupportedPoints: []byte{0x00, 0x01, 0x02}},
 			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
 				utls.X25519,
 				utls.CurveP256,
+				utls.CurveP521,
 				utls.CurveP384,
 			}},
-			&utls.SupportedPointsExtension{SupportedPoints: []byte{0x00}},
+			&utls.SessionTicketExtension{},
+			&utls.UtlsEncryptThenMACExtension{},
+			&utls.UtlsExtendedMasterSecretExtension{},
 			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
 				utls.ECDSAWithP256AndSHA256,
 				utls.ECDSAWithP384AndSHA384,
@@ -283,17 +301,14 @@ func buildWindowsSchannelSpec() *utls.ClientHelloSpec {
 				utls.PKCS1WithSHA384,
 				utls.PKCS1WithSHA512,
 			}},
-			&utls.StatusRequestExtension{},
-			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
-				{Group: utls.X25519},
-			}},
 			&utls.SupportedVersionsExtension{Versions: []uint16{
 				utls.VersionTLS13,
 				utls.VersionTLS12,
 			}},
 			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
-			&utls.UtlsExtendedMasterSecretExtension{},
-			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+				{Group: utls.X25519},
+			}},
 		},
 	}
 }

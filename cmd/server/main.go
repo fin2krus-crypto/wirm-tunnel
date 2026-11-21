@@ -68,6 +68,7 @@ func main() {
 		go tunToClientLoop(iface)
 	}
 
+	// Сервер остаётся с профилем Windows Server 2022/2025 Schannel (http.sys)
 	tlsConfig := &tls.Config{
 		Certificates:             []tls.Certificate{tlsCert},
 		MinVersion:               tls.VersionTLS12,
