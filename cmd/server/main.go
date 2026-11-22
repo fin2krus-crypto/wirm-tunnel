@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -18,51 +19,43 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
-	"github.com/songgao/water"
 	"winrm-vpn/common"
 )
 
 const (
-	AppVersion  = "0.0.4"
-	ServerTunIP = "10.88.0.1/24"
-	WinRMHost   = "WIN-8K2M9P1Q4R0"
-)
-
-var (
-	clientWriterMu sync.RWMutex
-	activeClientW  io.Writer
+	AppVersion = "0.0.4"
+	WinRMHost  = "WIN-8K2M9P1Q4R0"
 )
 
 func printQuickGuide() {
-	fmt.Printf(`WinRM-VPN Server v%s (Windows Server 2022/2025 WinRM HTTPS Mimicry)
+	fmt.Printf(`WinRM-VPN Server v%s (Userspace Netstack — БЕЗ TUN и БЕЗ root!)
 
-Короткая инструкция по настройке на Linux (x86_64):
+Короткая инструкция по запуску на Linux (x86_64):
   1. Откройте порт 5986/TCP в фаерволе:
        ufw allow 5986/tcp
 
-  2. Примените настройки NAT и TCP-стека Windows (TTL=128, tcp_timestamps=0):
-       chmod +x setup_linux_stealth.sh
-       ./setup_linux_stealth.sh
-
-  3. Сгенерируйте секретный ключ (PSK):
+  2. Сгенерируйте секретный ключ (PSK):
        openssl rand -hex 24
 
-  4. Запустите сервер (от root):
+  3. Запустите сервер (root и iptables НЕ требуются):
        ./winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
 
-  5. Скопируйте выведенный при запуске Certificate SHA-256 Pin в Android-клиент.
+     (Для нескольких пользователей можно указать ключи через запятую: -psk "key1,key2")
+
+  4. Скопируйте выведенный Certificate SHA-256 Pin в Android-клиент.
+
+Опционально (если есть root, для полного TCP-отпечатка Windows Server):
+  sysctl -w net.ipv4.tcp_timestamps=0
 
 Параметры запуска:
   -listen string   Адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
-  -psk    string   Секретный ключ для скрытой NTLM-авторизации (обязательно)
+  -psk    string   Ключ или список ключей через запятую (обязательно)
   -cert   string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
   -key    string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
-  -no-tun          Запуск без создания TUN-интерфейса (только режим проверки WinRM)
 `, AppVersion)
 }
 
@@ -73,13 +66,20 @@ func main() {
 	}
 
 	listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM HTTPS listen address")
-	psk := flag.String("psk", "", "Pre-Shared Key for covert NTLM authentication (required)")
+	pskFlag := flag.String("psk", "", "Pre-Shared Key(s), comma-separated (required)")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
 	keyFile := flag.String("key", "winrm_key.pem", "Path to TLS key")
-	noTun := flag.Bool("no-tun", false, "Run without TUN interface (for CI Test-WSMan verification)")
+	_ = flag.Bool("no-tun", false, "Deprecated (TUN is no longer required)")
 	flag.Parse()
 
-	if *psk == "" {
+	var pskList []string
+	for _, k := range strings.Split(*pskFlag, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			pskList = append(pskList, k)
+		}
+	}
+	if len(pskList) == 0 {
 		fmt.Println("Ошибка: не указан обязательный параметр -psk.")
 		fmt.Println()
 		printQuickGuide()
@@ -91,19 +91,11 @@ func main() {
 		log.Fatalf("Certificate error: %v", err)
 	}
 	log.Printf("================================================================")
-	log.Printf("WinRM-VPN Server v%s Ready on %s", AppVersion, *listenAddr)
+	log.Printf("WinRM-VPN Server v%s (No-TUN Multi-Client) Ready on %s", AppVersion, *listenAddr)
+	log.Printf("Loaded PSK keys: %d", len(pskList))
 	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
 	log.Printf("%s", fingerprint)
 	log.Printf("================================================================")
-
-	var iface *water.Interface
-	if !*noTun {
-		iface, err = setupTunInterface()
-		if err != nil {
-			log.Fatalf("Failed to setup TUN: %v (run as root)", err)
-		}
-		go tunToClientLoop(iface)
-	}
 
 	tlsConfig := &tls.Config{
 		Certificates:             []tls.Certificate{tlsCert},
@@ -128,59 +120,41 @@ func main() {
 		},
 	}
 
-	ln, err := tls.Listen("tcp4", *listenAddr, tlsConfig)
+	// Выставляем IP_TTL = 128 (как в Windows Server) прямо на сокет без root
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			_ = c.Control(func(fd uintptr) {
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, 128)
+			})
+			return nil
+		},
+	}
+
+	rawLn, err := lc.Listen(context.Background(), "tcp4", *listenAddr)
 	if err != nil {
 		log.Fatalf("Listen failed: %v", err)
 	}
+	ln := tls.NewListener(rawLn, tlsConfig)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			continue
 		}
-		go handleWinRMConnection(conn, *psk, iface)
+		go handleWinRMConnection(conn, pskList)
 	}
 }
 
-func setupTunInterface() (*water.Interface, error) {
-	cfg := water.Config{DeviceType: water.TUN}
-	cfg.Name = "winrm0"
-	iface, err := water.New(cfg)
-	if err != nil {
-		return nil, err
-	}
-	cmds := [][]string{
-		{"ip", "addr", "replace", ServerTunIP, "dev", iface.Name()},
-		{"ip", "link", "set", "dev", iface.Name(), "mtu", "1380", "up"},
-	}
-	for _, c := range cmds {
-		if out, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("%v: %s", err, string(out))
+func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) bool {
+	for _, psk := range pskList {
+		if common.VerifyNTLMType3Auth(b64Token, psk, challenge) {
+			return true
 		}
 	}
-	return iface, nil
+	return false
 }
 
-func tunToClientLoop(iface *water.Interface) {
-	pkt := make([]byte, 2048)
-	for {
-		n, err := iface.Read(pkt)
-		if err != nil {
-			continue
-		}
-		if n < 20 || (pkt[0]>>4) != 4 {
-			continue
-		}
-		clientWriterMu.RLock()
-		w := activeClientW
-		clientWriterMu.RUnlock()
-		if w != nil {
-			_ = common.WritePaddedFrame(w, pkt[:n])
-		}
-	}
-}
-
-func handleWinRMConnection(conn net.Conn, psk string, iface *water.Interface) {
+func handleWinRMConnection(conn net.Conn, pskList []string) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
@@ -237,34 +211,30 @@ func handleWinRMConnection(conn net.Conn, psk string, iface *water.Interface) {
 		}
 
 		if hasChallenge && strings.HasPrefix(b64Token, "TlRMTVNTUAAD") {
-			if common.VerifyNTLMType3Auth(b64Token, psk, currentChallenge) {
+			if verifyAnyPSK(b64Token, pskList, currentChallenge) {
 				writeWinRM200StreamStart(conn)
 				_ = conn.SetDeadline(time.Time{})
 
-				if iface == nil {
+				// Создаём изолированный userspace TCP/IP-стек для этого клиента
+				ns, err := NewClientNetstack(func(pkt []byte) error {
+					return common.WritePaddedFrame(conn, pkt)
+				})
+				if err != nil {
+					log.Printf("Netstack init error for %s: %v", conn.RemoteAddr(), err)
 					return
 				}
+				defer ns.Close()
 
-				clientWriterMu.Lock()
-				activeClientW = conn
-				clientWriterMu.Unlock()
-
+				log.Printf("[+] Client connected: %s", conn.RemoteAddr())
 				scratch := make([]byte, 65536)
 				for {
 					ipPkt, err := common.ReadPaddedFrame(br, scratch)
 					if err != nil {
 						break
 					}
-					if len(ipPkt) >= 20 && (ipPkt[0]>>4) == 4 {
-						_, _ = iface.Write(ipPkt)
-					}
+					ns.InjectPacket(ipPkt)
 				}
-
-				clientWriterMu.Lock()
-				if activeClientW == conn {
-					activeClientW = nil
-				}
-				clientWriterMu.Unlock()
+				log.Printf("[-] Client disconnected: %s", conn.RemoteAddr())
 				return
 			}
 		}
