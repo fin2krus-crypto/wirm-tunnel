@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
