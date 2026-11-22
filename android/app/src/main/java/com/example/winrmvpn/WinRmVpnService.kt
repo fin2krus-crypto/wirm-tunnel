@@ -24,8 +24,10 @@ object VpnStateBus {
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
     val logs = CopyOnWriteArrayList<String>()
     @Volatile var currentState: String = "DISCONNECTED"
-    @Volatile var onLogListener: ((String) -> Unit)? = null
-    @Volatile var onStateListener: ((String) -> Unit)? = null
+    
+    // Позволяем и Activity, и шторке одновременно получать статусы
+    val logListeners = CopyOnWriteArrayList<(String) -> Unit>()
+    val stateListeners = CopyOnWriteArrayList<(String) -> Unit>()
 
     fun log(msg: String) {
         val line = "[${timeFmt.format(Date())}] $msg"
@@ -33,12 +35,12 @@ object VpnStateBus {
         if (logs.size > 300) {
             logs.removeAt(0)
         }
-        onLogListener?.invoke(line)
+        logListeners.forEach { it.invoke(line) }
     }
 
     fun updateState(state: String) {
         currentState = state
-        onStateListener?.invoke(state)
+        stateListeners.forEach { it.invoke(state) }
     }
 
     fun clearLogs() {
@@ -115,10 +117,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
                     VpnStateBus.log("[NETWORK] System default network is available.")
                 }
                 lastNetwork = network
-                
-                // ВАЖНО: мы убрали setUnderlyingNetworks(arrayOf(network)), 
-                // чтобы не ломать системную проверку Wi-Fi на наличие интернета.
-                // Android автоматически проложит маршрут VPN через текущую сеть.
                 setUnderlyingNetworks(null)
             }
 
@@ -134,8 +132,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
                 }
             }
         }
-        
-        // Слушаем только успешную смену главной системной сети
         cm.registerDefaultNetworkCallback(networkCallback!!)
     }
 
