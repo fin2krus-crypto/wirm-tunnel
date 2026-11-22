@@ -63,10 +63,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM HTTPS listen address")
+listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM listen address")
 	pskFlag := flag.String("psk", "", "Pre-Shared Key(s), comma-separated (required)")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
 	keyFile := flag.String("key", "winrm_key.pem", "Path to TLS key")
+	plainMode := flag.Bool("plain", false, "Listen plain TCP (use behind winrm-tls-rustls)")
 	_ = flag.Bool("no-tun", false, "Deprecated (TUN is no longer required)")
 	flag.Parse()
 
@@ -89,35 +90,12 @@ func main() {
 		log.Fatalf("Certificate error: %v", err)
 	}
 	log.Printf("================================================================")
-	log.Printf("WinRM-VPN Server v%s (No-TUN Multi-Client) Ready on %s", AppVersion, *listenAddr)
+	log.Printf("WinRM-VPN Server v%s (No-TUN, Plain=%v) Ready on %s", AppVersion, *plainMode, *listenAddr)
 	log.Printf("Emulated Windows Hostname: %s", hostName)
 	log.Printf("Loaded PSK keys: %d", len(pskList))
 	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
 	log.Printf("%s", fingerprint)
 	log.Printf("================================================================")
-
-	tlsConfig := &tls.Config{
-		Certificates:             []tls.Certificate{tlsCert},
-		MinVersion:               tls.VersionTLS12,
-		MaxVersion:               tls.VersionTLS13,
-		PreferServerCipherSuites: true,
-		NextProtos:               nil,
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-			tls.CurveP384,
-		},
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-		},
-	}
 
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -132,7 +110,33 @@ func main() {
 	if err != nil {
 		log.Fatalf("Listen failed: %v", err)
 	}
-	ln := tls.NewListener(rawLn, tlsConfig)
+
+	var ln net.Listener = rawLn
+	if !*plainMode {
+		tlsConfig := &tls.Config{
+			Certificates:             []tls.Certificate{tlsCert},
+			MinVersion:               tls.VersionTLS12,
+			MaxVersion:               tls.VersionTLS13,
+			PreferServerCipherSuites: true,
+			NextProtos:               nil,
+			CurvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+				tls.CurveP384,
+			},
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			},
+		}
+		ln = tls.NewListener(rawLn, tlsConfig)
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -141,6 +145,7 @@ func main() {
 		}
 		go handleWinRMConnection(conn, pskList, hostName)
 	}
+	
 }
 
 func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) bool {
