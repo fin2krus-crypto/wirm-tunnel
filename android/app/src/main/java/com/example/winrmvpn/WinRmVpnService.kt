@@ -9,7 +9,6 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -103,9 +102,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
 
     private fun setupNetworkMonitor() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
@@ -113,12 +109,15 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
                 if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
 
                 if (lastNetwork != null && lastNetwork != network) {
-                    VpnStateBus.log("[NETWORK] Switched to new network ($network). Forcing reconnect...")
+                    VpnStateBus.log("[NETWORK] Default network changed ($network). Forcing reconnect...")
                     Mobile.triggerReconnect()
                 } else if (lastNetwork == null) {
-                    VpnStateBus.log("[NETWORK] System network is available.")
+                    VpnStateBus.log("[NETWORK] System default network is available.")
                 }
                 lastNetwork = network
+                
+                // Указываем Android явно маршрутизировать VPN через эту физическую сеть
+                setUnderlyingNetworks(arrayOf(network))
             }
 
             override fun onLost(network: Network) {
@@ -126,13 +125,16 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
                 if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
 
                 if (network == lastNetwork) {
-                    VpnStateBus.log("[NETWORK] Active network lost. Reconnecting...")
+                    VpnStateBus.log("[NETWORK] Default network lost. Waiting for new connection...")
                     Mobile.triggerReconnect()
                     lastNetwork = null
+                    setUnderlyingNetworks(null)
                 }
             }
         }
-        cm.registerNetworkCallback(request, networkCallback!!)
+        
+        // Слушаем только смену дефолтной сети (бесшовный переход Mobile -> Wi-Fi)
+        cm.registerDefaultNetworkCallback(networkCallback!!)
     }
 
     private fun stopNetworkMonitor() {
@@ -144,6 +146,7 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
         networkCallback = null
         lastNetwork = null
+        setUnderlyingNetworks(null)
     }
 
     override fun protect(fd: Long): Boolean {
@@ -187,14 +190,14 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("WinRM-VPN v0.0.8")
+                .setContentTitle("WinRM-VPN v0.0.9")
                 .setContentText("Should looks like Ansible")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("WinRM-VPN v0.0.8")
+                .setContentTitle("WinRM-VPN v0.0.9")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         }
