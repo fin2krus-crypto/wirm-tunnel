@@ -35,6 +35,26 @@ class MainActivity : Activity() {
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
 
+    private var lastAppliedState: String = ""
+
+    // Обработчики шины
+    private val logListener: (String) -> Unit = { line ->
+        runOnUiThread {
+            if (logText.text.isNotEmpty()) {
+                logText.append("\n$line")
+            } else {
+                logText.text = line
+            }
+            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private val stateListener: (String) -> Unit = { state ->
+        runOnUiThread {
+            applyStateUi(state)
+        }
+    }
+
     private val asciiLogo = """
 __        ___       ____  __  __    __     ______  _   _
 \ \      / (_)_ __ |  _ \|  \/  |   \ \   / /  _ \| \ | |
@@ -57,7 +77,6 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(36, 36, 36, 48)
         }
 
-        // ASCII-логотип
         val logoView = TextView(this).apply {
             text = asciiLogo
             typeface = Typeface.MONOSPACE
@@ -67,7 +86,6 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 8, 0, 8)
         }
 
-        // Версия 0.0.8 + подпись
         val versionView = TextView(this).apply {
             text = "v0.0.8  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
@@ -77,7 +95,6 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 0, 0, 24)
         }
 
-        // Поля ввода
         serverInput = EditText(this).apply {
             hint = "Server IP:Port (e.g. 203.0.113.10:5986)"
             setText(prefs.getString("server", ""))
@@ -97,7 +114,6 @@ __        ___       ____  __  __    __     ______  _   _
             setHintTextColor(Color.parseColor("#78909C"))
         }
 
-        // Поле ошибок валидации
         errorText = TextView(this).apply {
             setTextColor(Color.parseColor("#FF5252"))
             textSize = 13f
@@ -105,7 +121,6 @@ __        ___       ____  __  __    __     ______  _   _
             visibility = View.GONE
         }
 
-        // Кнопки Connect / Disconnect
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 12, 0, 12)
@@ -140,7 +155,6 @@ __        ___       ____  __  __    __     ______  _   _
         btnRow.addView(btnConnect)
         btnRow.addView(btnDisconnect)
 
-        // Статус подключения
         statusText = TextView(this).apply {
             text = "Статус: Отключено"
             textSize = 14f
@@ -148,7 +162,6 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 8, 0, 12)
         }
 
-        // Ряд ручных кнопок диагностики
         val toolsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 4, 0, 8)
@@ -177,7 +190,6 @@ __        ___       ____  __  __    __     ______  _   _
         toolsRow.addView(btnPingTest)
         toolsRow.addView(btnCheckIp)
 
-        // Результаты ручной проверки
         pingResultText = TextView(this).apply {
             text = ""
             textSize = 14f
@@ -192,7 +204,6 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 4, 0, 16)
         }
 
-        // Логи
         val logHeaderRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -248,29 +259,17 @@ __        ___       ____  __  __    __     ______  _   _
         rootScroll.addView(layout)
         setContentView(rootScroll)
 
-        VpnStateBus.onLogListener = { line ->
-            runOnUiThread {
-                if (logText.text.isNotEmpty()) {
-                    logText.append("\n$line")
-                } else {
-                    logText.text = line
-                }
-                logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
-            }
-        }
-
-        VpnStateBus.onStateListener = { state ->
-            runOnUiThread {
-                applyStateUi(state)
-            }
-        }
+        // Добавляем слушателей
+        VpnStateBus.logListeners.add(logListener)
+        VpnStateBus.stateListeners.add(stateListener)
 
         applyStateUi(VpnStateBus.currentState)
     }
 
     override fun onDestroy() {
-        VpnStateBus.onLogListener = null
-        VpnStateBus.onStateListener = null
+        // Обязательно удаляем слушателей при закрытии Activity
+        VpnStateBus.logListeners.remove(logListener)
+        VpnStateBus.stateListeners.remove(stateListener)
         super.onDestroy()
     }
 
@@ -286,7 +285,7 @@ __        ___       ____  __  __    __     ______  _   _
         val parts = server.split(":")
         val port = parts.getOrNull(1)?.toIntOrNull()
         if (parts.size != 2 || parts[0].isBlank() || port == null || port !in 1..65535) {
-            showValidationError("Ошибка: неверный формат сервера. Укажите IP:Port (например, 203.0.113.10:5986).")
+            showValidationError("Ошибка: неверный формат сервера. Укажите IP:Port.")
             return false
         }
         if (psk.isEmpty()) {
@@ -294,7 +293,7 @@ __        ___       ____  __  __    __     ______  _   _
             return false
         }
         if (pin.isNotEmpty() && !pin.matches(Regex("^[0-9a-fA-F]{64}$"))) {
-            showValidationError("Ошибка: SHA-256 Pin введён неверно (нужно ровно 64 hex-символа или оставьте пустым).")
+            showValidationError("Ошибка: SHA-256 Pin введён неверно.")
             return false
         }
 
@@ -309,6 +308,9 @@ __        ___       ____  __  __    __     ______  _   _
     }
 
     private fun applyStateUi(state: String) {
+        val stateChanged = (state != lastAppliedState)
+        lastAppliedState = state
+
         when (state) {
             "CONNECTING" -> {
                 statusText.text = "Статус: Подключение..."
@@ -326,7 +328,7 @@ __        ___       ____  __  __    __     ______  _   _
                 errorText.visibility = View.GONE
             }
             "ERROR" -> {
-                statusText.text = "Статус: Ошибка подключения (см. логи ниже)"
+                statusText.text = "Статус: Ошибка (см. логи ниже)"
                 statusText.setTextColor(Color.parseColor("#FF5252"))
                 btnPingTest.isEnabled = false
                 btnCheckIp.isEnabled = false
