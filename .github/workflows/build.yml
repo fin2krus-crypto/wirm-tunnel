@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Linux x86_64 + Rustls + Android APK)
+name: Build WinRM VPN (All-in-One Linux Server + Android APK)
 
 on:
   push:
@@ -35,29 +35,30 @@ jobs:
         with:
           packages: "platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125"
 
+      - name: Build Static Rustls TLS Front-End (musl x86_64)
+        working-directory: tls-front
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl
+          mkdir -p ../cmd/server/embedded
+          cp target/x86_64-unknown-linux-musl/release/winrm-tls-rustls ../cmd/server/embedded/winrm-tls-rustls
+
       - name: Tidy Go dependencies
         run: |
           go mod tidy
 
-      - name: Build Linux x86_64 Server Binary
+      - name: Build All-in-One Linux x86_64 Server Binary (v0.0.7)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/winrm-vpn-server ./cmd/server
-          cp cmd/server/setup_linux_stealth.sh dist/ || true
 
-      - name: Build Rustls TLS Front-End (Linux x86_64)
-        working-directory: tls-front
+      - name: Smoke-test All-in-One Binary (WinRM Identify, NTLM & ChaCha20 Rejection)
         run: |
-          cargo build --release
-          cp target/release/winrm-tls-rustls ../dist/
-
-      - name: Smoke-test WinRM Identify, NTLM & ChaCha20 Rejection (Rustls)
-        run: |
-          ./dist/winrm-vpn-server -plain -listen 127.0.0.1:15986 -psk "test-secret-key" &
-          GO_PID=$!
-          sleep 2
-          ./dist/winrm-tls-rustls 0.0.0.0:5986 127.0.0.1:15986 winrm_cert.pem winrm_key.pem &
-          RS_PID=$!
+          ./dist/winrm-vpn-server -listen 0.0.0.0:5986 -psk "test-secret-key" &
+          SRV_PID=$!
           sleep 2
           RESP=$(curl -sk --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman \
             -H "Content-Type: application/soap+xml;charset=UTF-8" \
@@ -68,11 +69,11 @@ jobs:
           echo "$HDRS" | grep -q "WWW-Authenticate: Negotiate"
           if curl -sk --tlsv1.3 --tls13-ciphers TLS_CHACHA20_POLY1305_SHA256 https://127.0.0.1:5986/wsman >/dev/null 2>&1; then
             echo "FAIL: ChaCha20 was accepted!"
-            kill $RS_PID $GO_PID
+            kill $SRV_PID
             exit 1
           fi
-          echo "OK: ChaCha20 rejected as expected!"
-          kill $RS_PID $GO_PID
+          echo "OK: All-in-One server v0.0.7 passed all WinRM & ChaCha20 checks!"
+          kill $SRV_PID
 
       - name: Build Android Native Core (.aar) via Gomobile
         env:
@@ -97,15 +98,13 @@ jobs:
           name: winrm-vpn-release
           path: |
             dist/winrm-vpn-server
-            dist/winrm-tls-rustls
             dist/winrm-vpn-client.apk
 
       - name: Publish separate files to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.4
-          name: WinRM-VPN v0.0.4
+          tag_name: v0.0.7
+          name: WinRM-VPN v0.0.7
           files: |
             dist/winrm-vpn-server
-            dist/winrm-tls-rustls
             dist/winrm-vpn-client.apk
