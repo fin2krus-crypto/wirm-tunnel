@@ -200,24 +200,106 @@ func VerifyNTLMType3Auth(b64Token string, psk string, serverChallenge [8]byte) b
 	return hmac.Equal(gotSig, expectedSig)
 }
 
-// Случайный паддинг (160..480 байт для мелких пакетов), чтобы убрать фиксированный пик в гистограмме длин
+// isInnerTLSHandshake определяет вложенный TLS Handshake (ClientHello/ServerHello/Certificate/CCS) внутри IPv4 TCP-пакета
+func isInnerTLSHandshake(ipPkt []byte) bool {
+	if len(ipPkt) < 43 || (ipPkt[0]>>4) != 4 || ipPkt[9] != 6 {
+		return false
+	}
+	ihl := int(ipPkt[0]&0x0f) * 4
+	if len(ipPkt) < ihl+20 {
+		return false
+	}
+	tcpDataOff := int(ipPkt[ihl+12]>>4) * 4
+	payloadStart := ihl + tcpDataOff
+	if len(ipPkt) < payloadStart+3 {
+		return false
+	}
+	contentType := ipPkt[payloadStart]
+	tlsMajor := ipPkt[payloadStart+1]
+	return (contentType == 0x16 || contentType == 0x14) && tlsMajor == 0x03
+}
+
+func fillFastRandom(b []byte) {
+	for i := 0; i < len(b); i += 8 {
+		v := mathrand.Uint64()
+		for j := 0; j < 8 && i+j < len(b); j++ {
+			b[i+j] = byte(v >> (j * 8))
+		}
+	}
+}
+
+// WritePaddedFrame защищает от детекта TLS-in-TLS и анализа гистограммы длин:
+// 1. Вложенные TLS-хендшейки получают тяжёлый случайный паддинг (150..700 Б) и режутся на 2-3 отдельных внешних TLS-рекорда.
+// 2. Мелкие пакеты выравниваются в случайный диапазон (160..520 Б).
+// 3. Крупные пакеты с вероятностью 50% дробятся на 2 случайных рекорда, ломая сигнатуру цепочек Certificate.
 func WritePaddedFrame(w io.Writer, ipPkt []byte) error {
 	pktLen := len(ipPkt)
 	if pktLen > 65535 {
 		return errors.New("packet too large")
 	}
+
+	innerTLS := isInnerTLSHandshake(ipPkt)
 	padLen := 0
-	if pktLen > 0 && pktLen < 400 {
-		target := 160 + mathrand.Intn(320)
+
+	if innerTLS {
+		padLen = 150 + mathrand.Intn(550)
+	} else if pktLen > 0 && pktLen < 450 {
+		target := 160 + mathrand.Intn(360)
 		if target > pktLen {
 			padLen = target - pktLen
 		}
 	}
+
 	totalLen := 4 + pktLen + padLen
 	buf := make([]byte, totalLen)
 	binary.BigEndian.PutUint16(buf[0:2], uint16(pktLen))
 	binary.BigEndian.PutUint16(buf[2:4], uint16(padLen))
 	copy(buf[4:4+pktLen], ipPkt)
+	if padLen > 0 {
+		fillFastRandom(buf[4+pktLen:])
+	}
+
+	// Разбиение на несколько внешних TLS-рекордов для уничтожения сигнатуры TLS-in-TLS
+	if innerTLS && totalLen > 220 {
+		parts := 2 + mathrand.Intn(2) // 2 или 3 отдельных TLS-рекорда
+		offset := 0
+		for p := 0; p < parts; p++ {
+			remaining := totalLen - offset
+			var chunkLen int
+			if p == parts-1 {
+				chunkLen = remaining
+			} else {
+				minChunk := 64
+				maxChunk := remaining - (parts-1-p)*minChunk
+				if maxChunk <= minChunk {
+					chunkLen = remaining
+				} else {
+					chunkLen = minChunk + mathrand.Intn(maxChunk-minChunk)
+				}
+			}
+			if _, err := w.Write(buf[offset : offset+chunkLen]); err != nil {
+				return err
+			}
+			offset += chunkLen
+			if offset >= totalLen {
+				break
+			}
+			// Микро-джиттер 1..3 мс между фрагментами вложенного TLS-хендшейка
+			time.Sleep(time.Duration(1+mathrand.Intn(3)) * time.Millisecond)
+		}
+		return nil
+	}
+
+	// Для крупных пакетов (>=450 Б) в 50% случаев режем на 2 случайных рекорда
+	if pktLen >= 450 && mathrand.Intn(2) == 0 {
+		cut := totalLen/4 + mathrand.Intn(totalLen/2)
+		if _, err := w.Write(buf[:cut]); err != nil {
+			return err
+		}
+		_, err := w.Write(buf[cut:])
+		return err
+	}
+
 	_, err := w.Write(buf)
 	return err
 }
