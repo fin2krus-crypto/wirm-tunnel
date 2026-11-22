@@ -133,14 +133,14 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("WinRM-VPN v0.0.3")
-                .setContentText("Active: Ansible OpenSSL 3.x -> 5986/TCP")
+                .setContentTitle("WinRM-VPN v0.0.4")
+                .setContentText("Should looks like Ansible")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("WinRM-VPN v0.0.3")
+                .setContentTitle("WinRM-VPN v0.0.4")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         }
