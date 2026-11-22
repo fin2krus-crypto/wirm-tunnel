@@ -37,7 +37,6 @@ class MainActivity : Activity() {
 
     private var lastAppliedState: String = ""
 
-    // Обработчики шины
     private val logListener: (String) -> Unit = { line ->
         runOnUiThread {
             if (logText.text.isNotEmpty()) {
@@ -87,7 +86,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.0.8  |  Should looks like Ansible"
+            text = "v0.0.9  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -259,7 +258,6 @@ __        ___       ____  __  __    __     ______  _   _
         rootScroll.addView(layout)
         setContentView(rootScroll)
 
-        // Добавляем слушателей
         VpnStateBus.logListeners.add(logListener)
         VpnStateBus.stateListeners.add(stateListener)
 
@@ -267,7 +265,6 @@ __        ___       ____  __  __    __     ______  _   _
     }
 
     override fun onDestroy() {
-        // Обязательно удаляем слушателей при закрытии Activity
         VpnStateBus.logListeners.remove(logListener)
         VpnStateBus.stateListeners.remove(stateListener)
         super.onDestroy()
