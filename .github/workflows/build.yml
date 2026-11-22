@@ -103,8 +103,8 @@ jobs:
       - name: Publish separate files to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.0.7
-          name: WinRM-VPN v0.0.7
+          tag_name: v0.0.8
+          name: WinRM-VPN v0.0.8
           files: |
             dist/winrm-vpn-server
             dist/winrm-vpn-client.apk
