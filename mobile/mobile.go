@@ -50,7 +50,6 @@ func emitState(cb TunnelCallback, state string) {
 	}
 }
 
-// TriggerReconnect вызывается из Android при смене сети (Wi-Fi <-> LTE)
 func TriggerReconnect() {
 	mu.Lock()
 	if activeConn != nil {
@@ -154,28 +153,26 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		return fmt.Errorf("TCP connect failed: %w", err)
 	}
 
-	// Оборачиваем соединение и сразу сохраняем в activeConn, 
-	// чтобы смена сети могла моментально разорвать даже зависший хендшейк
-	uCfg := &utls.Config{
-		InsecureSkipVerify: true,
-	}
-	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
-
 	mu.Lock()
-	activeConn = uConn
+	activeConn = rawConn
 	mu.Unlock()
 
 	defer func() {
 		mu.Lock()
-		if activeConn == uConn {
+		if activeConn == rawConn {
 			activeConn = nil
 		}
 		mu.Unlock()
-		uConn.Close()
+		rawConn.Close()
 	}()
 
 	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
 	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
+
+	uCfg := &utls.Config{
+		InsecureSkipVerify: true,
+	}
+	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
 
 	if err := uConn.ApplyPreset(buildAnsibleLinuxOpenSSL3Spec()); err != nil {
 		return fmt.Errorf("uTLS preset error: %w", err)
