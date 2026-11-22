@@ -28,6 +28,7 @@ import (
 )
 
 const (
+	AppVersion  = "0.0.4"
 	ServerTunIP = "10.88.0.1/24"
 	WinRMHost   = "WIN-8K2M9P1Q4R0"
 )
@@ -37,7 +38,40 @@ var (
 	activeClientW  io.Writer
 )
 
+func printQuickGuide() {
+	fmt.Printf(`WinRM-VPN Server v%s (Windows Server 2022/2025 WinRM HTTPS Mimicry)
+
+Короткая инструкция по настройке на Linux (x86_64):
+  1. Откройте порт 5986/TCP в фаерволе:
+       ufw allow 5986/tcp
+
+  2. Примените настройки NAT и TCP-стека Windows (TTL=128, tcp_timestamps=0):
+       chmod +x setup_linux_stealth.sh
+       ./setup_linux_stealth.sh
+
+  3. Сгенерируйте секретный ключ (PSK):
+       openssl rand -hex 24
+
+  4. Запустите сервер (от root):
+       ./winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
+
+  5. Скопируйте выведенный при запуске Certificate SHA-256 Pin в Android-клиент.
+
+Параметры запуска:
+  -listen string   Адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
+  -psk    string   Секретный ключ для скрытой NTLM-авторизации (обязательно)
+  -cert   string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
+  -key    string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
+  -no-tun          Запуск без создания TUN-интерфейса (только режим проверки WinRM)
+`, AppVersion)
+}
+
 func main() {
+	if len(os.Args) == 1 {
+		printQuickGuide()
+		os.Exit(0)
+	}
+
 	listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM HTTPS listen address")
 	psk := flag.String("psk", "", "Pre-Shared Key for covert NTLM authentication (required)")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
@@ -46,7 +80,10 @@ func main() {
 	flag.Parse()
 
 	if *psk == "" {
-		log.Fatal("ERROR: -psk flag is required")
+		fmt.Println("Ошибка: не указан обязательный параметр -psk.")
+		fmt.Println()
+		printQuickGuide()
+		os.Exit(1)
 	}
 
 	tlsCert, fingerprint, err := loadOrGenerateWindowsCert(*certFile, *keyFile)
@@ -54,7 +91,7 @@ func main() {
 		log.Fatalf("Certificate error: %v", err)
 	}
 	log.Printf("================================================================")
-	log.Printf("WinRM Stealth Server Ready on %s", *listenAddr)
+	log.Printf("WinRM-VPN Server v%s Ready on %s", AppVersion, *listenAddr)
 	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
 	log.Printf("%s", fingerprint)
 	log.Printf("================================================================")
@@ -68,7 +105,6 @@ func main() {
 		go tunToClientLoop(iface)
 	}
 
-	// Сервер остаётся с профилем Windows Server 2022/2025 Schannel (http.sys)
 	tlsConfig := &tls.Config{
 		Certificates:             []tls.Certificate{tlsCert},
 		MinVersion:               tls.VersionTLS12,
@@ -219,149 +255,4 @@ func handleWinRMConnection(conn net.Conn, psk string, iface *water.Interface) {
 					if err != nil {
 						break
 					}
-					if len(ipPkt) >= 20 && (ipPkt[0]>>4) == 4 {
-						_, _ = iface.Write(ipPkt)
-					}
-				}
-
-				clientWriterMu.Lock()
-				if activeClientW == conn {
-					activeClientW = nil
-				}
-				clientWriterMu.Unlock()
-				return
-			}
-		}
-
-		writeWinRM401Final(conn)
-		return
-	}
-}
-
-func httpDate() string {
-	return time.Now().UTC().Format(http.TimeFormat)
-}
-
-func writeHttpSys404(w io.Writer) {
-	body := common.HttpSysNotFoundHTML
-	resp := fmt.Sprintf("HTTP/1.1 404 Not Found\r\n"+
-		"Content-Type: text/html; charset=us-ascii\r\n"+
-		"Server: %s\r\n"+
-		"Date: %s\r\n"+
-		"Connection: close\r\n"+
-		"Content-Length: %d\r\n\r\n%s",
-		common.ServerHeader, httpDate(), len(body), body)
-	_, _ = io.WriteString(w, resp)
-}
-
-func writeWSManIdentify200(w io.Writer) {
-	body := common.WSManIdentifyResponseXML
-	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Server: %s\r\n"+
-		"Date: %s\r\n"+
-		"Content-Length: %d\r\n\r\n%s",
-		common.ServerHeader, httpDate(), len(body), body)
-	_, _ = io.WriteString(w, resp)
-}
-
-func writeWinRM401NoToken(w io.Writer) {
-	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
-		"Server: %s\r\n"+
-		"WWW-Authenticate: Negotiate\r\n"+
-		"WWW-Authenticate: Kerberos\r\n"+
-		"WWW-Authenticate: CredSSP\r\n"+
-		"Date: %s\r\n"+
-		"Content-Length: 0\r\n\r\n",
-		common.ServerHeader, httpDate())
-	_, _ = io.WriteString(w, resp)
-}
-
-func writeWinRM401Type2(w io.Writer, type2B64 string) {
-	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
-		"Server: %s\r\n"+
-		"WWW-Authenticate: Negotiate %s\r\n"+
-		"Date: %s\r\n"+
-		"Content-Length: 0\r\n\r\n",
-		common.ServerHeader, type2B64, httpDate())
-	_, _ = io.WriteString(w, resp)
-}
-
-func writeWinRM401Final(w io.Writer) {
-	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
-		"Server: %s\r\n"+
-		"WWW-Authenticate: Negotiate\r\n"+
-		"Date: %s\r\n"+
-		"Connection: close\r\n"+
-		"Content-Length: 0\r\n\r\n",
-		common.ServerHeader, httpDate())
-	_, _ = io.WriteString(w, resp)
-}
-
-func writeWinRM200StreamStart(w io.Writer) {
-	soap := common.FakeSoapCreateShellResponseXML
-	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Server: %s\r\n"+
-		"Date: %s\r\n"+
-		"Content-Length: %d\r\n\r\n%s",
-		common.ServerHeader, httpDate(), len(soap), soap)
-	_, _ = io.WriteString(w, resp)
-}
-
-func loadOrGenerateWindowsCert(certPath, keyPath string) (tls.Certificate, string, error) {
-	if _, err := os.Stat(certPath); err == nil {
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-		if err != nil {
-			return tls.Certificate{}, "", err
-		}
-		h := sha256.Sum256(cert.Certificate[0])
-		return cert, hex.EncodeToString(h[:]), nil
-	}
-
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return tls.Certificate{}, "", err
-	}
-
-	serialBytes := make([]byte, 16)
-	_, _ = rand.Read(serialBytes)
-	serialBytes[0] &= 0x7f
-
-	now := time.Now().UTC()
-	tmpl := x509.Certificate{
-		SerialNumber: new(big.Int).SetBytes(serialBytes),
-		Subject:      pkix.Name{CommonName: WinRMHost},
-		NotBefore:    now.Add(-10 * time.Minute),
-		NotAfter:     now.Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{WinRMHost},
-	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, "", err
-	}
-
-	certOut, err := os.Create(certPath)
-	if err != nil {
-		return tls.Certificate{}, "", err
-	}
-	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	_ = certOut.Close()
-
-	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return tls.Certificate{}, "", err
-	}
-	_ = pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-	_ = keyOut.Close()
-
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		return tls.Certificate{}, "", err
-	}
-	h := sha256.Sum256(derBytes)
-	return cert, hex.EncodeToString(h[:]), nil
-}
+					if len(ipPkt) >= 20 && (ipPkt[0]>>4) ==
