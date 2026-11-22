@@ -67,9 +67,9 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 8, 0, 8)
         }
 
-        // Версия 0.0.6 + подпись
+        // Версия 0.0.8 + подпись
         val versionView = TextView(this).apply {
-            text = "v0.0.6  |  Should looks like Ansible"
+            text = "v0.0.8  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -148,7 +148,7 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 8, 0, 12)
         }
 
-        // Ряд ручных кнопок диагностики: Ping 8.8.8.8 и Проверка IP/страны
+        // Ряд ручных кнопок диагностики
         val toolsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 4, 0, 8)
@@ -177,7 +177,7 @@ __        ___       ____  __  __    __     ______  _   _
         toolsRow.addView(btnPingTest)
         toolsRow.addView(btnCheckIp)
 
-        // Результат ручного пинга 8.8.8.8
+        // Результаты ручной проверки
         pingResultText = TextView(this).apply {
             text = ""
             textSize = 14f
@@ -185,7 +185,6 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 4, 0, 6)
         }
 
-        // Результат ручной проверки IP и страны
         ipResultText = TextView(this).apply {
             text = ""
             textSize = 14f
@@ -193,7 +192,7 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 4, 0, 16)
         }
 
-        // Заголовок и окно подробных логов
+        // Логи
         val logHeaderRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
