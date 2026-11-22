@@ -2,13 +2,13 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	_ "embed"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -20,6 +20,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"strings"
 	"syscall"
 	"time"
@@ -27,10 +29,13 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.0.4"
+const AppVersion = "0.0.7"
+
+//go:embed embedded/winrm-tls-rustls
+var embeddedRustlsBin []byte
 
 func printQuickGuide() {
-	fmt.Printf(`WinRM-VPN Server v%s (Userspace Netstack — БЕЗ TUN и БЕЗ root!)
+	fmt.Printf(`WinRM-VPN Server v%s (All-in-One: Rustls AES-GCM + gVisor Netstack — БЕЗ TUN и БЕЗ root!)
 
 Короткая инструкция по запуску на Linux (x86_64):
   1. Откройте порт 5986/TCP в фаерволе:
@@ -39,10 +44,10 @@ func printQuickGuide() {
   2. Сгенерируйте секретный ключ (PSK):
        openssl rand -hex 24
 
-  3. Запустите сервер (root и iptables НЕ требуются):
+  3. Запустите единый бинарник (root и iptables НЕ требуются):
        ./winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
 
-     (Для нескольких пользователей можно указать ключи через запятую: -psk "key1,key2")
+     (Для нескольких пользователей укажите ключи через запятую: -psk "key1,key2")
 
   4. Скопируйте выведенный Certificate SHA-256 Pin в Android-клиент.
 
@@ -50,7 +55,7 @@ func printQuickGuide() {
   sysctl -w net.ipv4.tcp_timestamps=0
 
 Параметры запуска:
-  -listen string   Адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
+  -listen string   Внешний адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
   -psk    string   Ключ или список ключей через запятую (обязательно)
   -cert   string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
   -key    string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
@@ -63,11 +68,10 @@ func main() {
 		os.Exit(0)
 	}
 
-listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM listen address")
+	listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM HTTPS listen address")
 	pskFlag := flag.String("psk", "", "Pre-Shared Key(s), comma-separated (required)")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
 	keyFile := flag.String("key", "winrm_key.pem", "Path to TLS key")
-	plainMode := flag.Bool("plain", false, "Listen plain TCP (use behind winrm-tls-rustls)")
 	_ = flag.Bool("no-tun", false, "Deprecated (TUN is no longer required)")
 	flag.Parse()
 
@@ -85,67 +89,108 @@ listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM listen address")
 		os.Exit(1)
 	}
 
-	tlsCert, fingerprint, hostName, err := loadOrGenerateWindowsCert(*certFile, *keyFile)
+	_, fingerprint, hostName, err := loadOrGenerateWindowsCert(*certFile, *keyFile)
 	if err != nil {
 		log.Fatalf("Certificate error: %v", err)
 	}
+
+	// 1. Поднимаем локальный Go-бэкенд (WinRM + gVisor Netstack) на свободном loopback-порту
+	backendLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		log.Fatalf("Internal backend listen failed: %v", err)
+	}
+	defer backendLn.Close()
+	backendAddr := backendLn.Addr().String()
+
+	// 2. Распаковываем и запускаем встроенный Rustls-фронтенд (AES-GCM only, без ChaCha20, TTL=128)
+	rustlsCmd, tmpPath, err := startEmbeddedRustls(*listenAddr, backendAddr, *certFile, *keyFile)
+	if err != nil {
+		log.Fatalf("Failed to start embedded rustls frontend: %v", err)
+	}
+	cleanup := func() {
+		if rustlsCmd != nil && rustlsCmd.Process != nil {
+			_ = rustlsCmd.Process.Signal(syscall.SIGTERM)
+			_ = rustlsCmd.Wait()
+		}
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}
+	defer cleanup()
+
+	// Корректная остановка обоих процессов по Ctrl+C / SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Printf("[SYS] Shutting down WinRM-VPN Server v%s...", AppVersion)
+		cleanup()
+		os.Exit(0)
+	}()
+
+	// Следим, чтобы фронтенд не упал (например, если порт 5986 уже занят)
+	go func() {
+		err := rustlsCmd.Wait()
+		_ = os.Remove(tmpPath)
+		log.Fatalf("Embedded rustls frontend exited unexpectedly: %v", err)
+	}()
+
 	log.Printf("================================================================")
-	log.Printf("WinRM-VPN Server v%s (No-TUN, Plain=%v) Ready on %s", AppVersion, *plainMode, *listenAddr)
+	log.Printf("WinRM-VPN Server v%s (All-in-One: Rustls + gVisor) Ready on %s", AppVersion, *listenAddr)
 	log.Printf("Emulated Windows Hostname: %s", hostName)
 	log.Printf("Loaded PSK keys: %d", len(pskList))
 	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
 	log.Printf("%s", fingerprint)
 	log.Printf("================================================================")
 
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			_ = c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, 128)
-			})
-			return nil
-		},
-	}
-
-	rawLn, err := lc.Listen(context.Background(), "tcp4", *listenAddr)
-	if err != nil {
-		log.Fatalf("Listen failed: %v", err)
-	}
-
-	var ln net.Listener = rawLn
-	if !*plainMode {
-		tlsConfig := &tls.Config{
-			Certificates:             []tls.Certificate{tlsCert},
-			MinVersion:               tls.VersionTLS12,
-			MaxVersion:               tls.VersionTLS13,
-			PreferServerCipherSuites: true,
-			NextProtos:               nil,
-			CurvePreferences: []tls.CurveID{
-				tls.X25519,
-				tls.CurveP256,
-				tls.CurveP384,
-			},
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-			},
-		}
-		ln = tls.NewListener(rawLn, tlsConfig)
-	}
-
 	for {
-		conn, err := ln.Accept()
+		conn, err := backendLn.Accept()
 		if err != nil {
 			continue
 		}
 		go handleWinRMConnection(conn, pskList, hostName)
 	}
-	
+}
+
+func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*exec.Cmd, string, error) {
+	if len(embeddedRustlsBin) == 0 {
+		return nil, "", errors.New("embedded rustls binary is empty")
+	}
+
+	tmpFile, err := os.CreateTemp("", "winrm-tls-*")
+	if err != nil {
+		return nil, "", err
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(embeddedRustlsBin); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return nil, "", err
+	}
+	if err := tmpFile.Chmod(0700); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return nil, "", err
+	}
+	// Обязательно закрываем дескриптор до запуска, чтобы избежать ETXTBSY
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, "", err
+	}
+
+	cmd := exec.Command(tmpPath, listenAddr, backendAddr, certPath, keyPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: syscall.SIGTERM,
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, "", err
+	}
+	return cmd, tmpPath, nil
 }
 
 func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) bool {
@@ -176,7 +221,6 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 	for {
 		req, err := http.ReadRequest(br)
 		if err != nil {
-			// На битые HTTP-пробы отвечаем эталонным 400 Bad Request от http.sys
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isTimeoutOrClosed(err) {
 				writeHttpSys400(conn)
 			}
@@ -239,12 +283,12 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 					return common.WritePaddedFrame(conn, pkt)
 				})
 				if err != nil {
-					log.Printf("Netstack init error for %s: %v", conn.RemoteAddr(), err)
+					log.Printf("Netstack init error: %v", err)
 					return
 				}
 				defer ns.Close()
 
-				log.Printf("[+] Client connected: %s", conn.RemoteAddr())
+				log.Printf("[+] Client connected")
 				scratch := make([]byte, 65536)
 				for {
 					ipPkt, err := common.ReadPaddedFrame(br, scratch)
@@ -253,7 +297,7 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 					}
 					ns.InjectPacket(ipPkt)
 				}
-				log.Printf("[-] Client disconnected: %s", conn.RemoteAddr())
+				log.Printf("[-] Client disconnected")
 				return
 			}
 		}
@@ -346,7 +390,6 @@ func writeWinRM200StreamStart(w io.Writer) {
 	_, _ = io.WriteString(w, resp)
 }
 
-// Генерирует случайное 15-символьное имя хоста в формате Windows Server: WIN-XXXXXXXXXXX
 func generateRandomWinHost() string {
 	const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	b := make([]byte, 11)
