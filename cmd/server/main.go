@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,10 +27,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const (
-	AppVersion = "0.0.4"
-	WinRMHost  = "WIN-8K2M9P1Q4R0"
-)
+const AppVersion = "0.0.4"
 
 func printQuickGuide() {
 	fmt.Printf(`WinRM-VPN Server v%s (Userspace Netstack — БЕЗ TUN и БЕЗ root!)
@@ -86,12 +84,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	tlsCert, fingerprint, err := loadOrGenerateWindowsCert(*certFile, *keyFile)
+	tlsCert, fingerprint, hostName, err := loadOrGenerateWindowsCert(*certFile, *keyFile)
 	if err != nil {
 		log.Fatalf("Certificate error: %v", err)
 	}
 	log.Printf("================================================================")
 	log.Printf("WinRM-VPN Server v%s (No-TUN Multi-Client) Ready on %s", AppVersion, *listenAddr)
+	log.Printf("Emulated Windows Hostname: %s", hostName)
 	log.Printf("Loaded PSK keys: %d", len(pskList))
 	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
 	log.Printf("%s", fingerprint)
@@ -120,7 +119,6 @@ func main() {
 		},
 	}
 
-	// Выставляем IP_TTL = 128 (как в Windows Server) прямо на сокет без root
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			_ = c.Control(func(fd uintptr) {
@@ -141,7 +139,7 @@ func main() {
 		if err != nil {
 			continue
 		}
-		go handleWinRMConnection(conn, pskList)
+		go handleWinRMConnection(conn, pskList, hostName)
 	}
 }
 
@@ -154,7 +152,15 @@ func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) bool {
 	return false
 }
 
-func handleWinRMConnection(conn net.Conn, pskList []string) {
+func isTimeoutOrClosed(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return errors.Is(err, net.ErrClosed)
+}
+
+func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
@@ -165,8 +171,17 @@ func handleWinRMConnection(conn net.Conn, pskList []string) {
 	for {
 		req, err := http.ReadRequest(br)
 		if err != nil {
+			// На битые HTTP-пробы отвечаем эталонным 400 Bad Request от http.sys
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isTimeoutOrClosed(err) {
+				writeHttpSys400(conn)
+			}
 			return
 		}
+		if req.Host == "" {
+			writeHttpSys400(conn)
+			return
+		}
+
 		bodyBytes, _ := io.ReadAll(io.LimitReader(req.Body, 524288))
 		_ = req.Body.Close()
 
@@ -204,7 +219,7 @@ func handleWinRMConnection(conn net.Conn, pskList []string) {
 
 		if strings.HasPrefix(b64Token, "TlRMTVNTUAAB") {
 			var type2B64 string
-			type2B64, currentChallenge = common.BuildNTLMType2(WinRMHost)
+			type2B64, currentChallenge = common.BuildNTLMType2(hostName)
 			hasChallenge = true
 			writeWinRM401Type2(conn, type2B64)
 			continue
@@ -215,7 +230,6 @@ func handleWinRMConnection(conn net.Conn, pskList []string) {
 				writeWinRM200StreamStart(conn)
 				_ = conn.SetDeadline(time.Time{})
 
-				// Создаём изолированный userspace TCP/IP-стек для этого клиента
 				ns, err := NewClientNetstack(func(pkt []byte) error {
 					return common.WritePaddedFrame(conn, pkt)
 				})
@@ -246,6 +260,18 @@ func handleWinRMConnection(conn net.Conn, pskList []string) {
 
 func httpDate() string {
 	return time.Now().UTC().Format(http.TimeFormat)
+}
+
+func writeHttpSys400(w io.Writer) {
+	body := common.HttpSysBadRequestHTML
+	resp := fmt.Sprintf("HTTP/1.1 400 Bad Request\r\n"+
+		"Content-Type: text/html; charset=us-ascii\r\n"+
+		"Server: %s\r\n"+
+		"Date: %s\r\n"+
+		"Connection: close\r\n"+
+		"Content-Length: %d\r\n\r\n%s",
+		common.ServerHeader, httpDate(), len(body), body)
+	_, _ = io.WriteString(w, resp)
 }
 
 func writeHttpSys404(w io.Writer) {
@@ -315,19 +341,38 @@ func writeWinRM200StreamStart(w io.Writer) {
 	_, _ = io.WriteString(w, resp)
 }
 
-func loadOrGenerateWindowsCert(certPath, keyPath string) (tls.Certificate, string, error) {
+// Генерирует случайное 15-символьное имя хоста в формате Windows Server: WIN-XXXXXXXXXXX
+func generateRandomWinHost() string {
+	const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, 11)
+	_, _ = rand.Read(b)
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	return "WIN-" + string(b)
+}
+
+func loadOrGenerateWindowsCert(certPath, keyPath string) (tls.Certificate, string, string, error) {
 	if _, err := os.Stat(certPath); err == nil {
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
-			return tls.Certificate{}, "", err
+			return tls.Certificate{}, "", "", err
 		}
 		h := sha256.Sum256(cert.Certificate[0])
-		return cert, hex.EncodeToString(h[:]), nil
+		hostName := ""
+		if parsed, err := x509.ParseCertificate(cert.Certificate[0]); err == nil && parsed.Subject.CommonName != "" {
+			hostName = parsed.Subject.CommonName
+		} else {
+			hostName = generateRandomWinHost()
+		}
+		return cert, hex.EncodeToString(h[:]), hostName, nil
 	}
+
+	hostName := generateRandomWinHost()
 
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return tls.Certificate{}, "", "", err
 	}
 
 	serialBytes := make([]byte, 16)
@@ -337,37 +382,37 @@ func loadOrGenerateWindowsCert(certPath, keyPath string) (tls.Certificate, strin
 	now := time.Now().UTC()
 	tmpl := x509.Certificate{
 		SerialNumber: new(big.Int).SetBytes(serialBytes),
-		Subject:      pkix.Name{CommonName: WinRMHost},
+		Subject:      pkix.Name{CommonName: hostName},
 		NotBefore:    now.Add(-10 * time.Minute),
 		NotAfter:     now.Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{WinRMHost},
+		DNSNames:     []string{hostName},
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return tls.Certificate{}, "", "", err
 	}
 
 	certOut, err := os.Create(certPath)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return tls.Certificate{}, "", "", err
 	}
 	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	_ = certOut.Close()
 
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return tls.Certificate{}, "", "", err
 	}
 	_ = pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
 	_ = keyOut.Close()
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return tls.Certificate{}, "", "", err
 	}
 	h := sha256.Sum256(derBytes)
-	return cert, hex.EncodeToString(h[:]), nil
+	return cert, hex.EncodeToString(h[:]), hostName, nil
 }
