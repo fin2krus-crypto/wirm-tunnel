@@ -174,6 +174,8 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 		}()
 	})
 
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+
 	// Цикл чтения ответных IPv4-пакетов из gVisor -> отправка клиенту в WinRM-туннель
 	go ns.outboundLoop()
 
