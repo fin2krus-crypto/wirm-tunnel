@@ -109,15 +109,17 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
                 if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
 
                 if (lastNetwork != null && lastNetwork != network) {
-                    VpnStateBus.log("[NETWORK] Default network changed ($network). Forcing reconnect...")
+                    VpnStateBus.log("[NETWORK] Default network changed. Forcing reconnect...")
                     Mobile.triggerReconnect()
                 } else if (lastNetwork == null) {
                     VpnStateBus.log("[NETWORK] System default network is available.")
                 }
                 lastNetwork = network
                 
-                // Указываем Android явно маршрутизировать VPN через эту физическую сеть
-                setUnderlyingNetworks(arrayOf(network))
+                // ВАЖНО: мы убрали setUnderlyingNetworks(arrayOf(network)), 
+                // чтобы не ломать системную проверку Wi-Fi на наличие интернета.
+                // Android автоматически проложит маршрут VPN через текущую сеть.
+                setUnderlyingNetworks(null)
             }
 
             override fun onLost(network: Network) {
@@ -133,7 +135,7 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
             }
         }
         
-        // Слушаем только смену дефолтной сети (бесшовный переход Mobile -> Wi-Fi)
+        // Слушаем только успешную смену главной системной сети
         cm.registerDefaultNetworkCallback(networkCallback!!)
     }
 
