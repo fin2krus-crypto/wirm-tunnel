@@ -34,6 +34,8 @@ class MainActivity : Activity() {
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
 
+    private var lastAppliedState: String = ""
+
     private val asciiLogo = """
 __        ___       ____  __  __    __     ______  _   _
 \ \      / (_)_ __ |  _ \|  \/  |   \ \   / /  _ \| \ | |
@@ -56,7 +58,7 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(36, 36, 36, 48)
         }
 
-        // 1. ASCII-логотип
+        // ASCII-логотип
         val logoView = TextView(this).apply {
             text = asciiLogo
             typeface = Typeface.MONOSPACE
@@ -66,9 +68,9 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 8, 0, 8)
         }
 
-        // 2. Версия приложения 0.0.3
+        // Версия 0.0.4 + подпись "Should looks like Ansible"
         val versionView = TextView(this).apply {
-            text = "v0.0.3  |  Ansible OpenSSL 3.x -> WinRM 5986"
+            text = "v0.0.4  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -160,7 +162,7 @@ __        ___       ____  __  __    __     ______  _   _
             text = "Проверить IP и страну (ifconfig.io)"
             isEnabled = false
             setOnClickListener {
-                checkIpAndCountry()
+                checkIpAndCountry(delayMs = 0L)
             }
         }
 
@@ -227,7 +229,6 @@ __        ___       ____  __  __    __     ______  _   _
         rootScroll.addView(layout)
         setContentView(rootScroll)
 
-        // Подписка на события из WinRmVpnService
         VpnStateBus.onLogListener = { line ->
             runOnUiThread {
                 if (logText.text.isNotEmpty()) {
@@ -254,7 +255,6 @@ __        ___       ____  __  __    __     ______  _   _
         super.onDestroy()
     }
 
-    // Валидация введённых данных
     private fun validateInputs(): Boolean {
         val server = serverInput.text.toString().trim()
         val psk = pskInput.text.toString().trim()
@@ -290,19 +290,26 @@ __        ___       ____  __  __    __     ______  _   _
     }
 
     private fun applyStateUi(state: String) {
+        val stateChanged = (state != lastAppliedState)
+        lastAppliedState = state
+
         when (state) {
             "CONNECTING" -> {
-                statusText.text = "Статус: Подключение к WinRM..."
+                statusText.text = "Статус: Подключение..."
                 statusText.setTextColor(Color.parseColor("#FFD54F"))
                 pingResultText.text = ""
+                ipResultText.text = ""
                 btnCheckIp.isEnabled = false
             }
             "CONNECTED" -> {
-                statusText.text = "Статус: Подключено (WinRM HTTPS)"
+                statusText.text = "Статус: Подключено"
                 statusText.setTextColor(Color.parseColor("#00E676"))
                 btnCheckIp.isEnabled = true
                 errorText.visibility = View.GONE
-                runPingTest()
+                if (stateChanged) {
+                    runPingTest()
+                    checkIpAndCountry(delayMs = 1200L)
+                }
             }
             "ERROR" -> {
                 statusText.text = "Статус: Ошибка подключения (см. логи ниже)"
@@ -317,7 +324,6 @@ __        ___       ____  __  __    __     ______  _   _
         }
     }
 
-    // Автоматическая проверка ping 8.8.8.8 после установления соединения
     private fun runPingTest() {
         pingResultText.setTextColor(Color.parseColor("#FFD54F"))
         pingResultText.text = "Выполняется тестовый ping 8.8.8.8..."
@@ -325,7 +331,7 @@ __        ___       ____  __  __    __     ______  _   _
 
         Thread {
             try {
-                Thread.sleep(700) // Даём Android применить таблицу маршрутизации TUN
+                Thread.sleep(700)
                 val proc = ProcessBuilder("/system/bin/ping", "-c", "1", "-W", "3", "8.8.8.8")
                     .redirectErrorStream(true)
                     .start()
@@ -357,14 +363,16 @@ __        ___       ____  __  __    __     ______  _   _
         }.start()
     }
 
-    // Проверка IP и страны через http://ifconfig.io/country_code и http://ifconfig.io/host
-    private fun checkIpAndCountry() {
+    private fun checkIpAndCountry(delayMs: Long = 0L) {
         ipResultText.setTextColor(Color.parseColor("#FFD54F"))
         ipResultText.text = "Запрос IP и страны через ifconfig.io..."
         VpnStateBus.log("[IP-CHECK] Fetching http://ifconfig.io/country_code & /host ...")
 
         Thread {
             try {
+                if (delayMs > 0) {
+                    Thread.sleep(delayMs)
+                }
                 val countryCode = httpGetCurl("http://ifconfig.io/country_code").trim().uppercase()
                 val hostOrIp = httpGetCurl("http://ifconfig.io/host").trim()
                 val flag = countryCodeToFlag(countryCode)
@@ -389,7 +397,6 @@ __        ___       ____  __  __    __     ______  _   _
         conn.requestMethod = "GET"
         conn.connectTimeout = 5000
         conn.readTimeout = 5000
-        // User-Agent curl гарантирует ответ в виде чистого текста (без HTML)
         conn.setRequestProperty("User-Agent", "curl/8.5.0")
         conn.setRequestProperty("Accept", "*/*")
         try {
