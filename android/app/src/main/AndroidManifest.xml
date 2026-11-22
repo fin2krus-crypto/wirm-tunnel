@@ -6,7 +6,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
-        android:label="WinRM DPI Test"
+        android:label="WinRM-VPN"
+        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault">
 
         <activity
