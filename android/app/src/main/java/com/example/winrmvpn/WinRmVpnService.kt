@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -25,7 +26,6 @@ object VpnStateBus {
     val logs = CopyOnWriteArrayList<String>()
     @Volatile var currentState: String = "DISCONNECTED"
     
-    // Позволяем и Activity, и шторке одновременно получать статусы
     val logListeners = CopyOnWriteArrayList<(String) -> Unit>()
     val stateListeners = CopyOnWriteArrayList<(String) -> Unit>()
 
@@ -105,34 +105,31 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
     private fun setupNetworkMonitor() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            .build()
+
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                val caps = cm.getNetworkCapabilities(network)
-                if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
-
-                if (lastNetwork != null && lastNetwork != network) {
-                    VpnStateBus.log("[NETWORK] Default network changed. Forcing reconnect...")
+                if (lastNetwork != network) {
+                    VpnStateBus.log("[NETWORK] Validated network changed ($network). Forcing reconnect...")
+                    lastNetwork = network
                     Mobile.triggerReconnect()
-                } else if (lastNetwork == null) {
-                    VpnStateBus.log("[NETWORK] System default network is available.")
                 }
-                lastNetwork = network
-                setUnderlyingNetworks(null)
             }
 
             override fun onLost(network: Network) {
-                val caps = cm.getNetworkCapabilities(network)
-                if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
-
                 if (network == lastNetwork) {
-                    VpnStateBus.log("[NETWORK] Default network lost. Waiting for new connection...")
-                    Mobile.triggerReconnect()
+                    VpnStateBus.log("[NETWORK] Current validated network lost. Waiting...")
                     lastNetwork = null
-                    setUnderlyingNetworks(null)
+                    Mobile.triggerReconnect()
                 }
             }
         }
-        cm.registerDefaultNetworkCallback(networkCallback!!)
+        
+        cm.registerNetworkCallback(request, networkCallback!!)
     }
 
     private fun stopNetworkMonitor() {
@@ -144,7 +141,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
         networkCallback = null
         lastNetwork = null
-        setUnderlyingNetworks(null)
     }
 
     override fun protect(fd: Long): Boolean {
