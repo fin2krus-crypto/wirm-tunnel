@@ -28,13 +28,12 @@ class MainActivity : Activity() {
 
     private lateinit var errorText: TextView
     private lateinit var statusText: TextView
+    private lateinit var btnPingTest: Button
+    private lateinit var btnCheckIp: Button
     private lateinit var pingResultText: TextView
     private lateinit var ipResultText: TextView
-    private lateinit var btnCheckIp: Button
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
-
-    private var lastAppliedState: String = ""
 
     private val asciiLogo = """
 __        ___       ____  __  __    __     ______  _   _
@@ -68,9 +67,9 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 8, 0, 8)
         }
 
-        // Версия 0.0.4 + подпись "Should looks like Ansible"
+        // Версия 0.0.6 + подпись
         val versionView = TextView(this).apply {
-            text = "v0.0.4  |  Should looks like Ansible"
+            text = "v0.0.6  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -146,31 +145,52 @@ __        ___       ____  __  __    __     ______  _   _
             text = "Статус: Отключено"
             textSize = 14f
             setTextColor(Color.parseColor("#CFD8DC"))
-            setPadding(0, 8, 0, 8)
+            setPadding(0, 8, 0, 12)
         }
 
-        // Результат автоматического пинга 8.8.8.8
+        // Ряд ручных кнопок диагностики: Ping 8.8.8.8 и Проверка IP/страны
+        val toolsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 4, 0, 8)
+        }
+
+        btnPingTest = Button(this).apply {
+            text = "Тест ping 8.8.8.8"
+            textSize = 12f
+            isEnabled = false
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener {
+                runPingTest()
+            }
+        }
+
+        btnCheckIp = Button(this).apply {
+            text = "Проверить IP и страну"
+            textSize = 12f
+            isEnabled = false
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener {
+                checkIpAndCountry()
+            }
+        }
+
+        toolsRow.addView(btnPingTest)
+        toolsRow.addView(btnCheckIp)
+
+        // Результат ручного пинга 8.8.8.8
         pingResultText = TextView(this).apply {
             text = ""
             textSize = 14f
             setTypeface(null, Typeface.BOLD)
-            setPadding(0, 4, 0, 12)
+            setPadding(0, 4, 0, 6)
         }
 
-        // Кнопка проверки IP и страны
-        btnCheckIp = Button(this).apply {
-            text = "Проверить IP и страну (ifconfig.io)"
-            isEnabled = false
-            setOnClickListener {
-                checkIpAndCountry(delayMs = 0L)
-            }
-        }
-
+        // Результат ручной проверки IP и страны
         ipResultText = TextView(this).apply {
             text = ""
             textSize = 14f
             setTextColor(Color.parseColor("#80D8FF"))
-            setPadding(0, 8, 0, 16)
+            setPadding(0, 4, 0, 16)
         }
 
         // Заголовок и окно подробных логов
@@ -220,8 +240,8 @@ __        ___       ____  __  __    __     ______  _   _
         layout.addView(errorText)
         layout.addView(btnRow)
         layout.addView(statusText)
+        layout.addView(toolsRow)
         layout.addView(pingResultText)
-        layout.addView(btnCheckIp)
         layout.addView(ipResultText)
         layout.addView(logHeaderRow)
         layout.addView(logScroll)
@@ -290,35 +310,32 @@ __        ___       ____  __  __    __     ______  _   _
     }
 
     private fun applyStateUi(state: String) {
-        val stateChanged = (state != lastAppliedState)
-        lastAppliedState = state
-
         when (state) {
             "CONNECTING" -> {
                 statusText.text = "Статус: Подключение..."
                 statusText.setTextColor(Color.parseColor("#FFD54F"))
                 pingResultText.text = ""
                 ipResultText.text = ""
+                btnPingTest.isEnabled = false
                 btnCheckIp.isEnabled = false
             }
             "CONNECTED" -> {
                 statusText.text = "Статус: Подключено"
                 statusText.setTextColor(Color.parseColor("#00E676"))
+                btnPingTest.isEnabled = true
                 btnCheckIp.isEnabled = true
                 errorText.visibility = View.GONE
-                if (stateChanged) {
-                    runPingTest()
-                    checkIpAndCountry(delayMs = 1200L)
-                }
             }
             "ERROR" -> {
                 statusText.text = "Статус: Ошибка подключения (см. логи ниже)"
                 statusText.setTextColor(Color.parseColor("#FF5252"))
+                btnPingTest.isEnabled = false
                 btnCheckIp.isEnabled = false
             }
             else -> {
                 statusText.text = "Статус: Отключено"
                 statusText.setTextColor(Color.parseColor("#CFD8DC"))
+                btnPingTest.isEnabled = false
                 btnCheckIp.isEnabled = false
             }
         }
@@ -331,7 +348,6 @@ __        ___       ____  __  __    __     ______  _   _
 
         Thread {
             try {
-                Thread.sleep(700)
                 val proc = ProcessBuilder("/system/bin/ping", "-c", "1", "-W", "3", "8.8.8.8")
                     .redirectErrorStream(true)
                     .start()
@@ -363,16 +379,13 @@ __        ___       ____  __  __    __     ______  _   _
         }.start()
     }
 
-    private fun checkIpAndCountry(delayMs: Long = 0L) {
+    private fun checkIpAndCountry() {
         ipResultText.setTextColor(Color.parseColor("#FFD54F"))
         ipResultText.text = "Запрос IP и страны через ifconfig.io..."
         VpnStateBus.log("[IP-CHECK] Fetching http://ifconfig.io/country_code & /host ...")
 
         Thread {
             try {
-                if (delayMs > 0) {
-                    Thread.sleep(delayMs)
-                }
                 val countryCode = httpGetCurl("http://ifconfig.io/country_code").trim().uppercase()
                 val hostOrIp = httpGetCurl("http://ifconfig.io/host").trim()
                 val flag = countryCodeToFlag(countryCode)
