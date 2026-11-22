@@ -255,4 +255,149 @@ func handleWinRMConnection(conn net.Conn, psk string, iface *water.Interface) {
 					if err != nil {
 						break
 					}
-					if len(ipPkt) >= 20 && (ipPkt[0]>>4) ==
+					if len(ipPkt) >= 20 && (ipPkt[0]>>4) == 4 {
+						_, _ = iface.Write(ipPkt)
+					}
+				}
+
+				clientWriterMu.Lock()
+				if activeClientW == conn {
+					activeClientW = nil
+				}
+				clientWriterMu.Unlock()
+				return
+			}
+		}
+
+		writeWinRM401Final(conn)
+		return
+	}
+}
+
+func httpDate() string {
+	return time.Now().UTC().Format(http.TimeFormat)
+}
+
+func writeHttpSys404(w io.Writer) {
+	body := common.HttpSysNotFoundHTML
+	resp := fmt.Sprintf("HTTP/1.1 404 Not Found\r\n"+
+		"Content-Type: text/html; charset=us-ascii\r\n"+
+		"Server: %s\r\n"+
+		"Date: %s\r\n"+
+		"Connection: close\r\n"+
+		"Content-Length: %d\r\n\r\n%s",
+		common.ServerHeader, httpDate(), len(body), body)
+	_, _ = io.WriteString(w, resp)
+}
+
+func writeWSManIdentify200(w io.Writer) {
+	body := common.WSManIdentifyResponseXML
+	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
+		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+		"Server: %s\r\n"+
+		"Date: %s\r\n"+
+		"Content-Length: %d\r\n\r\n%s",
+		common.ServerHeader, httpDate(), len(body), body)
+	_, _ = io.WriteString(w, resp)
+}
+
+func writeWinRM401NoToken(w io.Writer) {
+	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
+		"Server: %s\r\n"+
+		"WWW-Authenticate: Negotiate\r\n"+
+		"WWW-Authenticate: Kerberos\r\n"+
+		"WWW-Authenticate: CredSSP\r\n"+
+		"Date: %s\r\n"+
+		"Content-Length: 0\r\n\r\n",
+		common.ServerHeader, httpDate())
+	_, _ = io.WriteString(w, resp)
+}
+
+func writeWinRM401Type2(w io.Writer, type2B64 string) {
+	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
+		"Server: %s\r\n"+
+		"WWW-Authenticate: Negotiate %s\r\n"+
+		"Date: %s\r\n"+
+		"Content-Length: 0\r\n\r\n",
+		common.ServerHeader, type2B64, httpDate())
+	_, _ = io.WriteString(w, resp)
+}
+
+func writeWinRM401Final(w io.Writer) {
+	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
+		"Server: %s\r\n"+
+		"WWW-Authenticate: Negotiate\r\n"+
+		"Date: %s\r\n"+
+		"Connection: close\r\n"+
+		"Content-Length: 0\r\n\r\n",
+		common.ServerHeader, httpDate())
+	_, _ = io.WriteString(w, resp)
+}
+
+func writeWinRM200StreamStart(w io.Writer) {
+	soap := common.FakeSoapCreateShellResponseXML
+	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
+		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+		"Server: %s\r\n"+
+		"Date: %s\r\n"+
+		"Content-Length: %d\r\n\r\n%s",
+		common.ServerHeader, httpDate(), len(soap), soap)
+	_, _ = io.WriteString(w, resp)
+}
+
+func loadOrGenerateWindowsCert(certPath, keyPath string) (tls.Certificate, string, error) {
+	if _, err := os.Stat(certPath); err == nil {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return tls.Certificate{}, "", err
+		}
+		h := sha256.Sum256(cert.Certificate[0])
+		return cert, hex.EncodeToString(h[:]), nil
+	}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+
+	serialBytes := make([]byte, 16)
+	_, _ = rand.Read(serialBytes)
+	serialBytes[0] &= 0x7f
+
+	now := time.Now().UTC()
+	tmpl := x509.Certificate{
+		SerialNumber: new(big.Int).SetBytes(serialBytes),
+		Subject:      pkix.Name{CommonName: WinRMHost},
+		NotBefore:    now.Add(-10 * time.Minute),
+		NotAfter:     now.Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{WinRMHost},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	_ = certOut.Close()
+
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	_ = pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	_ = keyOut.Close()
+
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	h := sha256.Sum256(derBytes)
+	return cert, hex.EncodeToString(h[:]), nil
+}
