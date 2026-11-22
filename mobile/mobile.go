@@ -31,10 +31,11 @@ type TunnelCallback interface {
 }
 
 var (
-	mu         sync.Mutex
-	running    bool
-	stopChan   chan struct{}
-	activeConn net.Conn
+	mu            sync.Mutex
+	running       bool
+	stopChan      chan struct{}
+	reconnectChan chan struct{}
+	activeConn    net.Conn
 )
 
 func emitLog(cb TunnelCallback, format string, args ...any) {
@@ -49,6 +50,23 @@ func emitState(cb TunnelCallback, state string) {
 	}
 }
 
+// TriggerReconnect вызывается из Android при смене сети (Wi-Fi <-> LTE)
+func TriggerReconnect() {
+	mu.Lock()
+	if activeConn != nil {
+		_ = activeConn.Close()
+	}
+	ch := reconnectChan
+	mu.Unlock()
+
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha256 string, protector SocketProtector, cb TunnelCallback) error {
 	mu.Lock()
 	if running {
@@ -57,6 +75,7 @@ func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha2
 	}
 	running = true
 	stopChan = make(chan struct{})
+	reconnectChan = make(chan struct{}, 1)
 	mu.Unlock()
 
 	expectedPin := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(expectedCertSha256), ":", ""))
@@ -83,15 +102,16 @@ func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha2
 			err := runSingleSession(tunFile, serverAddr, psk, expectedPin, protector, cb)
 			if err != nil {
 				emitLog(cb, "[ERR] Session ended: %v", err)
-				emitState(cb, "ERROR")
 			}
 
 			select {
 			case <-stopChan:
 				emitState(cb, "DISCONNECTED")
 				return
+			case <-reconnectChan:
+				emitLog(cb, "[SYS] Reconnect triggered by network change...")
 			case <-time.After(3 * time.Second):
-				emitLog(cb, "[SYS] Reconnecting in 3s...")
+				emitLog(cb, "[SYS] Reconnecting after 3s...")
 			}
 		}
 	}()
@@ -110,6 +130,7 @@ func StopWinRMTunnel() {
 	if activeConn != nil {
 		_ = activeConn.Close()
 	}
+	reconnectChan = nil
 }
 
 func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, protector SocketProtector, cb TunnelCallback) error {
@@ -132,14 +153,30 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	if err != nil {
 		return fmt.Errorf("TCP connect failed: %w", err)
 	}
-	defer rawConn.Close()
-	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
 
-	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
+	// Оборачиваем соединение и сразу сохраняем в activeConn, 
+	// чтобы смена сети могла моментально разорвать даже зависший хендшейк
 	uCfg := &utls.Config{
 		InsecureSkipVerify: true,
 	}
 	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
+
+	mu.Lock()
+	activeConn = uConn
+	mu.Unlock()
+
+	defer func() {
+		mu.Lock()
+		if activeConn == uConn {
+			activeConn = nil
+		}
+		mu.Unlock()
+		uConn.Close()
+	}()
+
+	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
+	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
+
 	if err := uConn.ApplyPreset(buildAnsibleLinuxOpenSSL3Spec()); err != nil {
 		return fmt.Errorf("uTLS preset error: %w", err)
 	}
@@ -168,7 +205,6 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	br := bufio.NewReader(uConn)
 
-	// Шаг 1: NTLM Type 1
 	emitLog(cb, "[HTTP] -> POST %s (NTLM Type 1)", common.WinRMPath)
 	t1 := common.BuildNTLMType1()
 	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
@@ -215,7 +251,6 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	}
 	emitLog(cb, "[NTLM] Received Type 2 Challenge: %s", hex.EncodeToString(serverChallenge[:]))
 
-	// Шаг 2: NTLM Type 3 со скрытым HMAC + SOAP Create Shell
 	emitLog(cb, "[HTTP] -> POST %s (NTLM Type 3 + Covert HMAC + SOAP)", common.WinRMPath)
 	t3 := common.BuildNTLMType3WithAuth(psk, serverChallenge)
 	soapBody := common.FakeSoapCreateShellXML
@@ -245,10 +280,6 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	if resp2.ContentLength > 0 {
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
 	}
-
-	mu.Lock()
-	activeConn = uConn
-	mu.Unlock()
 
 	emitLog(cb, "[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
 	emitState(cb, "CONNECTED")
