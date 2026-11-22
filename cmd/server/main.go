@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -29,7 +30,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.0.8"
+const AppVersion = "0.0.9"
 
 //go:embed embedded/winrm-tls-rustls
 var embeddedRustlsBin []byte
@@ -94,7 +95,6 @@ func main() {
 		log.Fatalf("Certificate error: %v", err)
 	}
 
-	// 1. Поднимаем локальный Go-бэкенд (WinRM + gVisor Netstack) на свободном loopback-порту
 	backendLn, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		log.Fatalf("Internal backend listen failed: %v", err)
@@ -102,7 +102,6 @@ func main() {
 	defer backendLn.Close()
 	backendAddr := backendLn.Addr().String()
 
-	// 2. Распаковываем и запускаем встроенный Rustls-фронтенд (AES-GCM only, без ChaCha20, TTL=128)
 	rustlsCmd, tmpPath, err := startEmbeddedRustls(*listenAddr, backendAddr, *certFile, *keyFile)
 	if err != nil {
 		log.Fatalf("Failed to start embedded rustls frontend: %v", err)
@@ -118,7 +117,6 @@ func main() {
 	}
 	defer cleanup()
 
-	// Корректная остановка обоих процессов по Ctrl+C / SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -128,7 +126,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Следим, чтобы фронтенд не упал (например, если порт 5986 уже занят)
 	go func() {
 		err := rustlsCmd.Wait()
 		_ = os.Remove(tmpPath)
@@ -173,7 +170,6 @@ func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*ex
 		_ = os.Remove(tmpPath)
 		return nil, "", err
 	}
-	// Обязательно закрываем дескриптор до запуска, чтобы избежать ETXTBSY
 	if err := tmpFile.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, "", err
