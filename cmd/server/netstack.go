@@ -117,21 +117,22 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
 	// Обработчик UDP-потоков (DNS 1.1.1.1:53, QUIC и т.д.)
-	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
+	// Обработчик UDP-потоков (DNS 1.1.1.1:53, QUIC и т.д.)
+	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
 		id := r.ID()
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
 		var wq waiter.Queue
 		ep, tcpErr := r.CreateEndpoint(&wq)
 		if tcpErr != nil {
-			return false
+			return
 		}
-		inConn := gonet.NewUDPConn(&wq, ep)
+		inConn := gonet.NewUDPConn(s, &wq, ep)
 
 		outConn, err := net.DialTimeout("udp4", dst, 5*time.Second)
 		if err != nil {
 			_ = inConn.Close()
-			return true
+			return
 		}
 
 		go func() {
@@ -171,9 +172,7 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 			case <-ctx.Done():
 			}
 		}()
-		return true
 	})
-	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
 	// Цикл чтения ответных IPv4-пакетов из gVisor -> отправка клиенту в WinRM-туннель
 	go ns.outboundLoop()
