@@ -8,12 +8,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	mathrand "math/rand"
 	"time"
 	"unicode/utf16"
 )
 
 const (
-	// URI и заголовки Ansible (pywinrm поверх python-requests / OpenSSL 3.x)
 	WinRMPath      = "/wsman"
 	WinRMUserAgent = "Python WinRM client"
 	ServerHeader   = "Microsoft-HTTPAPI/2.0"
@@ -29,17 +29,22 @@ const HttpSysNotFoundHTML = `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN""h
 </BODY></HTML>
 `
 
-// Эталонный SOAP-запрос открытия WinRM Shell от Ansible pywinrm
+const HttpSysBadRequestHTML = `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN""http://www.w3.org/TR/html4/strict.dtd">
+<HTML><HEAD><TITLE>Bad Request</TITLE>
+<META HTTP-EQUIV="Content-Type" Content="text/html; charset=us-ascii"></HEAD>
+<BODY><h2>Bad Request</h2>
+<hr><p>HTTP Error 400. The request is badly formed.</p>
+</BODY></HTML>
+`
+
 const FakeSoapCreateShellXML = `<?xml version="1.0" encoding="UTF-8"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"><env:Header><a:To>http://windows-host:5986/wsman</a:To><a:ReplyTo><a:Address mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo><w:MaxEnvelopeSize mustUnderstand="true">153600</w:MaxEnvelopeSize><a:MessageID>uuid:2c7e09a4-5c43-4f82-9a14-83b2a9d1e042</a:MessageID><w:Locale mustUnderstand="false" xml:lang="en-US"/><p:DataLocale mustUnderstand="false" xml:lang="en-US"/><w:OperationTimeout>PT60S</w:OperationTimeout><w:ResourceURI mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><a:Action mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/09/transfer/Create</a:Action></env:Header><env:Body><rsp:Shell><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell></env:Body></env:Envelope>`
 
 const FakeSoapCreateShellResponseXML = `<s:Envelope xml:lang="en-US" xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:x="http://schemas.xmlsoap.org/ws/2004/09/transfer" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/CreateResponse</a:Action><a:MessageID>uuid:8B2F1D9E-3C10-4E5A-9A01-22E4D1F5A900</a:MessageID><a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To><a:RelatesTo>uuid:2c7e09a4-5c43-4f82-9a14-83b2a9d1e042</a:RelatesTo></s:Header><s:Body><x:ResourceCreated><a:Address>http://windows-host:5986/wsman</a:Address><a:ReferenceParameters><w:ResourceURI>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><w:SelectorSet><w:Selector Name="ShellId">6A9F0C12-5B8E-4D12-8F7A-9C3E1B2D4E5F</w:Selector></w:SelectorSet></a:ReferenceParameters></x:ResourceCreated><rsp:Shell xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><rsp:ShellId>6A9F0C12-5B8E-4D12-8F7A-9C3E1B2D4E5F</rsp:ShellId><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell></s:Body></s:Envelope>`
 
-// BuildNTLMType1 формирует NTLMSSP_NEGOTIATE в формате Python pyspnego / requests-ntlm
 func BuildNTLMType1() string {
 	buf := make([]byte, 40)
 	copy(buf[0:8], "NTLMSSP\x00")
 	binary.LittleEndian.PutUint32(buf[8:12], 1)
-	// Флаги pyspnego (Unicode, RequestTarget, NTLM, AlwaysSign, ExtendedSessionSecurity, Version, 128-bit, 56-bit)
 	binary.LittleEndian.PutUint32(buf[12:16], 0xe20882b7)
 	buf[32] = 6
 	buf[33] = 1
@@ -195,14 +200,18 @@ func VerifyNTLMType3Auth(b64Token string, psk string, serverChallenge [8]byte) b
 	return hmac.Equal(gotSig, expectedSig)
 }
 
+// Случайный паддинг (160..480 байт для мелких пакетов), чтобы убрать фиксированный пик в гистограмме длин
 func WritePaddedFrame(w io.Writer, ipPkt []byte) error {
 	pktLen := len(ipPkt)
 	if pktLen > 65535 {
 		return errors.New("packet too large")
 	}
 	padLen := 0
-	if pktLen > 0 && pktLen < 256 {
-		padLen = 256 - pktLen
+	if pktLen > 0 && pktLen < 400 {
+		target := 160 + mathrand.Intn(320)
+		if target > pktLen {
+			padLen = target - pktLen
+		}
 	}
 	totalLen := 4 + pktLen + padLen
 	buf := make([]byte, totalLen)
