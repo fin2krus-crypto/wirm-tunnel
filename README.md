@@ -14,7 +14,7 @@ IPv4-туннель. Проект реализует стелс-мимикрию
 
 Выполните на сервере под `root` одну команду:
 
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/wirm-tunnel/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/n0nam4ik/wirm-tunnel/main/install.sh | sudo bash
 
 ---
 ## Ключевые особенности и маскировка
