@@ -13,9 +13,9 @@ IPv4-туннель. Проект реализует стелс-мимикрию
 ## Быстрая автоматическая установка сервера (Debian 12 / 13)
 
 Выполните на сервере под `root` одну команду:
-
+```bash
 curl -fsSL https://raw.githubusercontent.com/n0nam4ik/wirm-tunnel/main/install.sh | sudo bash
-
+```
 ---
 ## Ключевые особенности и маскировка
 
