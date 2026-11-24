@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,7 @@ import (
 
 type UserRecord struct {
 	PSK           string `json:"psk"`
+	Label         string `json:"label,omitempty"`
 	CreatedAt     string `json:"created_at"`
 	TodayDate     string `json:"today_date"`
 	TodayRx       uint64 `json:"today_rx"`
@@ -29,6 +29,7 @@ type UsersDB struct {
 
 type UserSnapshot struct {
 	PSK           string `json:"psk"`
+	Label         string `json:"label"`
 	CreatedAt     string `json:"created_at"`
 	SessionRx     uint64 `json:"session_rx"`
 	SessionTx     uint64 `json:"session_tx"`
@@ -39,17 +40,32 @@ type UserSnapshot struct {
 	LastConnected string `json:"last_connected"`
 }
 
+type TrafficPoint struct {
+	Time  string `json:"time"`
+	RxBps uint64 `json:"rx_bps"`
+	TxBps uint64 `json:"tx_bps"`
+}
+
 type ServerStatsSnapshot struct {
-	Version     string         `json:"version"`
-	Running     bool           `json:"running"`
-	PID         int            `json:"pid"`
-	StartTime   time.Time      `json:"start_time"`
-	UptimeSec   int64          `json:"uptime_sec"`
-	TotalUsers  int            `json:"total_users"`
-	OnlineUsers int            `json:"online_users"`
-	TotalRx     uint64         `json:"total_rx"`
-	TotalTx     uint64         `json:"total_tx"`
-	Users       []UserSnapshot `json:"users"`
+	Version          string         `json:"version"`
+	Running          bool           `json:"running"`
+	VPNEngineRunning bool           `json:"vpn_running"`
+	PID              int            `json:"pid"`
+	ListenAddr       string         `json:"listen_addr"`
+	WebPort          int            `json:"web_port"`
+	HostName         string         `json:"host_name"`
+	CertPin          string         `json:"cert_pin"`
+	ExternalIP       string         `json:"external_ip"`
+	StartTime        time.Time      `json:"start_time"`
+	UptimeSec        int64          `json:"uptime_sec"`
+	TotalUsers       int            `json:"total_users"`
+	OnlineUsers      int            `json:"online_users"`
+	TotalRx          uint64         `json:"total_rx"`
+	TotalTx          uint64         `json:"total_tx"`
+	RxBps            uint64         `json:"rx_bps"`
+	TxBps            uint64         `json:"tx_bps"`
+	History          []TrafficPoint `json:"history"`
+	Users            []UserSnapshot `json:"users"`
 }
 
 type liveUserState struct {
@@ -60,19 +76,30 @@ type liveUserState struct {
 }
 
 type StatsManager struct {
-	mu          sync.RWMutex
-	dataDir     string
-	dbPath      string
-	envPath     string
-	sockPath    string
-	startTime   time.Time
-	totalRx     uint64
-	totalTx     uint64
-	nextConnID  uint64
-	users       map[string]*UserRecord
-	userOrder   []string
-	live        map[string]*liveUserState
-	stopFlushCh chan struct{}
+	mu           sync.RWMutex
+	dataDir      string
+	dbPath       string
+	envPath      string
+	sockPath     string
+	vpnRunning   bool
+	listenAddr   string
+	webPort      int
+	hostName     string
+	certPin      string
+	externalIP   string
+	startTime    time.Time
+	totalRx      uint64
+	totalTx      uint64
+	prevSampleRx uint64
+	prevSampleTx uint64
+	curRxBps     uint64
+	curTxBps     uint64
+	history      []TrafficPoint
+	nextConnID   uint64
+	users        map[string]*UserRecord
+	userOrder    []string
+	live         map[string]*liveUserState
+	stopFlushCh  chan struct{}
 }
 
 func resolveDataDir(flagDir string) string {
@@ -95,6 +122,8 @@ func NewStatsManager(dataDir string) *StatsManager {
 		envPath:     filepath.Join(dataDir, "config.env"),
 		sockPath:    filepath.Join(dataDir, "control.sock"),
 		startTime:   time.Now(),
+		webPort:     defaultWebPort,
+		history:     make([]TrafficPoint, 0, 60),
 		users:       make(map[string]*UserRecord),
 		live:        make(map[string]*liveUserState),
 		stopFlushCh: make(chan struct{}),
@@ -113,6 +142,69 @@ func rolloverUserDay(u *UserRecord, today string) {
 	}
 }
 
+func (sm *StatsManager) SetMetadata(listenAddr, hostName, certPin, extIP string, webPort int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if listenAddr != "" {
+		sm.listenAddr = listenAddr
+	}
+	if hostName != "" {
+		sm.hostName = hostName
+	}
+	if certPin != "" {
+		sm.certPin = certPin
+	}
+	if extIP != "" {
+		sm.externalIP = extIP
+	}
+	if webPort > 0 {
+		sm.webPort = webPort
+	}
+}
+
+func (sm *StatsManager) SetWebPort(port int) {
+	sm.mu.Lock()
+	sm.webPort = port
+	sm.mu.Unlock()
+}
+
+func (sm *StatsManager) SetVPNRunning(running bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.vpnRunning = running
+	if running {
+		sm.startTime = time.Now()
+		sm.totalRx = 0
+		sm.totalTx = 0
+		sm.prevSampleRx = 0
+		sm.prevSampleTx = 0
+		sm.curRxBps = 0
+		sm.curTxBps = 0
+		for _, lv := range sm.live {
+			lv.SessionRx = 0
+			lv.SessionTx = 0
+		}
+	} else {
+		sm.curRxBps = 0
+		sm.curTxBps = 0
+	}
+}
+
+func (sm *StatsManager) CloseAllActive() {
+	sm.mu.Lock()
+	var toClose []net.Conn
+	for _, lv := range sm.live {
+		for _, c := range lv.ActiveConns {
+			toClose = append(toClose, c)
+		}
+	}
+	sm.mu.Unlock()
+
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+}
+
 func (sm *StatsManager) LoadOrInit(cliPSKs []string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -120,7 +212,6 @@ func (sm *StatsManager) LoadOrInit(cliPSKs []string) error {
 	_ = os.MkdirAll(sm.dataDir, 0700)
 	sm.loadFromDiskLocked()
 
-	// Импортируем ключи из флага -psk (если каких-то ещё нет в базе)
 	today := currentDateStr()
 	nowStr := time.Now().Format("2006-01-02 15:04:05")
 	added := false
@@ -142,7 +233,6 @@ func (sm *StatsManager) LoadOrInit(cliPSKs []string) error {
 		}
 	}
 
-	// Если база пуста, пробуем подхватить из config.env
 	if len(sm.userOrder) == 0 {
 		for _, psk := range readPSKsFromEnv(sm.envPath) {
 			if _, exists := sm.users[psk]; !exists {
@@ -210,7 +300,127 @@ func (sm *StatsManager) saveToDiskLocked() error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, sm.dbPath)
+	if err := os.Rename(tmp, sm.dbPath); err != nil {
+		return err
+	}
+	syncPSKsToEnv(sm.envPath, sm.userOrder)
+	return nil
+}
+
+func (sm *StatsManager) AddUserDirect(psk, label string) error {
+	psk = strings.TrimSpace(psk)
+	label = strings.TrimSpace(label)
+	if psk == "" {
+		return errors.New("PSK не может быть пустым")
+	}
+	if strings.Contains(psk, ",") {
+		return errors.New("PSK не должен содержать запятую")
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if _, exists := sm.users[psk]; exists {
+		return errors.New("пользователь с таким PSK уже существует")
+	}
+
+	u := &UserRecord{
+		PSK:       psk,
+		Label:     label,
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+		TodayDate: currentDateStr(),
+	}
+	sm.users[psk] = u
+	sm.userOrder = append(sm.userOrder, psk)
+	sm.live[psk] = &liveUserState{ActiveConns: make(map[uint64]net.Conn)}
+	return sm.saveToDiskLocked()
+}
+
+func (sm *StatsManager) UpdateUserDirect(oldPSK, newPSK, label string) error {
+	oldPSK = strings.TrimSpace(oldPSK)
+	newPSK = strings.TrimSpace(newPSK)
+	label = strings.TrimSpace(label)
+	if newPSK == "" {
+		return errors.New("новый PSK не может быть пустым")
+	}
+	if strings.Contains(newPSK, ",") {
+		return errors.New("PSK не должен содержать запятую")
+	}
+
+	sm.mu.Lock()
+	u, exists := sm.users[oldPSK]
+	if !exists {
+		sm.mu.Unlock()
+		return errors.New("пользователь не найден")
+	}
+
+	var toClose []net.Conn
+	if oldPSK != newPSK {
+		if _, collision := sm.users[newPSK]; collision {
+			sm.mu.Unlock()
+			return errors.New("пользователь с таким новым PSK уже существует")
+		}
+		delete(sm.users, oldPSK)
+		u.PSK = newPSK
+		u.Label = label
+		sm.users[newPSK] = u
+
+		for i, k := range sm.userOrder {
+			if k == oldPSK {
+				sm.userOrder[i] = newPSK
+				break
+			}
+		}
+
+		if lv, ok := sm.live[oldPSK]; ok {
+			for _, c := range lv.ActiveConns {
+				toClose = append(toClose, c)
+			}
+			delete(sm.live, oldPSK)
+		}
+		sm.live[newPSK] = &liveUserState{ActiveConns: make(map[uint64]net.Conn)}
+	} else {
+		u.Label = label
+	}
+	err := sm.saveToDiskLocked()
+	sm.mu.Unlock()
+
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+	return err
+}
+
+func (sm *StatsManager) DeleteUserDirect(psk string) error {
+	psk = strings.TrimSpace(psk)
+
+	sm.mu.Lock()
+	if _, exists := sm.users[psk]; !exists {
+		sm.mu.Unlock()
+		return errors.New("пользователь не найден")
+	}
+	delete(sm.users, psk)
+	newOrder := make([]string, 0, len(sm.userOrder))
+	for _, k := range sm.userOrder {
+		if k != psk {
+			newOrder = append(newOrder, k)
+		}
+	}
+	sm.userOrder = newOrder
+
+	var toClose []net.Conn
+	if lv, ok := sm.live[psk]; ok {
+		for _, c := range lv.ActiveConns {
+			toClose = append(toClose, c)
+		}
+		delete(sm.live, psk)
+	}
+	err := sm.saveToDiskLocked()
+	sm.mu.Unlock()
+
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+	return err
 }
 
 func (sm *StatsManager) ReloadFromDisk() []net.Conn {
@@ -241,7 +451,6 @@ func (sm *StatsManager) ReloadFromDisk() []net.Conn {
 		}
 	}
 
-	// Собираем активные соединения удалённых пользователей для закрытия вне блокировки
 	var toClose []net.Conn
 	for psk, lv := range sm.live {
 		if _, stillExists := newUsers[psk]; !stillExists {
@@ -346,6 +555,33 @@ func (sm *StatsManager) AddTx(psk string, n int) {
 	}
 }
 
+func (sm *StatsManager) sampleTrafficSecond() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var rxBps, txBps uint64
+	if sm.totalRx >= sm.prevSampleRx {
+		rxBps = sm.totalRx - sm.prevSampleRx
+	}
+	if sm.totalTx >= sm.prevSampleTx {
+		txBps = sm.totalTx - sm.prevSampleTx
+	}
+	sm.prevSampleRx = sm.totalRx
+	sm.prevSampleTx = sm.totalTx
+	sm.curRxBps = rxBps
+	sm.curTxBps = txBps
+
+	pt := TrafficPoint{
+		Time:  time.Now().Format("15:04:05"),
+		RxBps: rxBps,
+		TxBps: txBps,
+	}
+	sm.history = append(sm.history, pt)
+	if len(sm.history) > 60 {
+		sm.history = sm.history[len(sm.history)-60:]
+	}
+}
+
 func (sm *StatsManager) Snapshot() ServerStatsSnapshot {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -376,6 +612,7 @@ func (sm *StatsManager) Snapshot() ServerStatsSnapshot {
 		}
 		usersOut = append(usersOut, UserSnapshot{
 			PSK:           u.PSK,
+			Label:         u.Label,
 			CreatedAt:     u.CreatedAt,
 			SessionRx:     sessRx,
 			SessionTx:     sessTx,
@@ -387,27 +624,48 @@ func (sm *StatsManager) Snapshot() ServerStatsSnapshot {
 		})
 	}
 
+	histCopy := make([]TrafficPoint, len(sm.history))
+	copy(histCopy, sm.history)
+
+	var uptimeSec int64
+	if sm.vpnRunning {
+		uptimeSec = int64(time.Since(sm.startTime).Seconds())
+	}
+
 	return ServerStatsSnapshot{
-		Version:     AppVersion,
-		Running:     true,
-		PID:         os.Getpid(),
-		StartTime:   sm.startTime,
-		UptimeSec:   int64(time.Since(sm.startTime).Seconds()),
-		TotalUsers:  len(usersOut),
-		OnlineUsers: onlineUsers,
-		TotalRx:     sm.totalRx,
-		TotalTx:     sm.totalTx,
-		Users:       usersOut,
+		Version:          AppVersion,
+		Running:          sm.vpnRunning,
+		VPNEngineRunning: sm.vpnRunning,
+		PID:              os.Getpid(),
+		ListenAddr:       sm.listenAddr,
+		WebPort:          sm.webPort,
+		HostName:         sm.hostName,
+		CertPin:          sm.certPin,
+		ExternalIP:       sm.externalIP,
+		StartTime:        sm.startTime,
+		UptimeSec:        uptimeSec,
+		TotalUsers:       len(usersOut),
+		OnlineUsers:      onlineUsers,
+		TotalRx:          sm.totalRx,
+		TotalTx:          sm.totalTx,
+		RxBps:            sm.curRxBps,
+		TxBps:            sm.curTxBps,
+		History:          histCopy,
+		Users:            usersOut,
 	}
 }
 
 func (sm *StatsManager) StartPeriodicFlush() {
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
+		secTicker := time.NewTicker(1 * time.Second)
+		saveTicker := time.NewTicker(15 * time.Second)
+		defer secTicker.Stop()
+		defer saveTicker.Stop()
 		for {
 			select {
-			case <-ticker.C:
+			case <-secTicker.C:
+				sm.sampleTrafficSecond()
+			case <-saveTicker.C:
 				sm.mu.Lock()
 				_ = sm.saveToDiskLocked()
 				sm.mu.Unlock()
@@ -430,8 +688,7 @@ func (sm *StatsManager) FlushAndClose() {
 	_ = os.Remove(sm.sockPath)
 }
 
-// StartControlSocket запускает локальный Unix-сокет для обмена статистикой и командами с CLI-меню
-func (sm *StatsManager) StartControlSocket(onShutdown func()) error {
+func (sm *StatsManager) StartControlSocket(vpnEngine *VPNEngine, onShutdown func()) error {
 	_ = os.Remove(sm.sockPath)
 	ln, err := net.Listen("unix", sm.sockPath)
 	if err != nil {
@@ -452,6 +709,30 @@ func (sm *StatsManager) StartControlSocket(onShutdown func()) error {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK\n"))
+	})
+	mux.HandleFunc("/vpn/start", func(w http.ResponseWriter, r *http.Request) {
+		if vpnEngine != nil {
+			if err := vpnEngine.Start(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		_, _ = w.Write([]byte("STARTED\n"))
+	})
+	mux.HandleFunc("/vpn/stop", func(w http.ResponseWriter, r *http.Request) {
+		if vpnEngine != nil {
+			vpnEngine.Stop()
+		}
+		_, _ = w.Write([]byte("STOPPED\n"))
+	})
+	mux.HandleFunc("/vpn/restart", func(w http.ResponseWriter, r *http.Request) {
+		if vpnEngine != nil {
+			if err := vpnEngine.Restart(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		_, _ = w.Write([]byte("RESTARTED\n"))
 	})
 	mux.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -545,7 +826,7 @@ func fetchLiveStats(dataDir string) (*ServerStatsSnapshot, error) {
 func sendControlCommand(dataDir, endpoint string) error {
 	sockPath := filepath.Join(dataDir, "control.sock")
 	client := &http.Client{
-		Timeout: 2 * time.Second,
+		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
 			Dial: func(_, _ string) (net.Conn, error) {
 				return net.DialTimeout("unix", sockPath, time.Second)
@@ -591,6 +872,7 @@ func loadOfflineUsersSnapshot(dataDir string) ServerStatsSnapshot {
 		}
 		users = append(users, UserSnapshot{
 			PSK:           u.PSK,
+			Label:         u.Label,
 			CreatedAt:     u.CreatedAt,
 			TodayRx:       tRx,
 			TodayTx:       tTx,
@@ -598,9 +880,12 @@ func loadOfflineUsersSnapshot(dataDir string) ServerStatsSnapshot {
 		})
 	}
 
+	panelCfg := loadPanelConfig(dataDir)
+
 	return ServerStatsSnapshot{
 		Version:    AppVersion,
 		Running:    false,
+		WebPort:    panelCfg.Port,
 		TotalUsers: len(users),
 		Users:      users,
 	}
@@ -623,7 +908,6 @@ func addUserToStorage(dataDir, newPSK string) error {
 	if raw, err := os.ReadFile(dbPath); err == nil {
 		_ = json.Unmarshal(raw, &db)
 	}
-	// Подтягиваем из config.env, если users.json ещё не был создан
 	if len(db.Users) == 0 {
 		for _, psk := range readPSKsFromEnv(envPath) {
 			db.Users = append(db.Users, &UserRecord{
@@ -710,9 +994,4 @@ func deleteUserFromStorage(dataDir, targetPSK string) error {
 	syncPSKsToEnv(envPath, psks)
 	_ = sendControlCommand(dataDir, "/reload")
 	return nil
-}
-
-// Вспомогательная сортировка для детерминированного вывода, если потребуется
-func sortStrings(s []string) {
-	sort.Strings(s)
 }
