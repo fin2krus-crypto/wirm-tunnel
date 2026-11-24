@@ -25,6 +25,12 @@ import (
 
 const defaultGitHubRepo = "n0nam4ik/wirm-tunnel"
 
+const serverAsciiLogo = `   __        ___       ____  __  __    __     ______  _   _
+   \ \      / (_)_ __ |  _ \|  \/  |   \ \   / /  _ \| \ | |
+    \ \ /\ / /| | '_ \| |_) | |\/| |____\ \ / /| |_) |  \| |
+     \ V  V / | | | | |  _ <| |  | |_____\ V / |  __/| |\  |
+      \_/\_/  |_|_| |_|_| \_\_|  |_|      \_/  |_|   |_| \_|`
+
 func runInteractiveCLI() {
 	dataDir := resolveDataDir("")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -81,7 +87,8 @@ func getDashboardSnapshot(dataDir string) ServerStatsSnapshot {
 func printDashboard(snap ServerStatsSnapshot, extIP, dataDir string) {
 	fmt.Print("\033[H\033[2J") // Очистка экрана терминала
 	fmt.Println("================================================================")
-	fmt.Printf("  WinRM-VPN Server v%s  —  Панель управления\n", AppVersion)
+	fmt.Println(serverAsciiLogo)
+	fmt.Printf("\n  Версия: %s  —  Панель управления сервером\n", AppVersion)
 	fmt.Println("================================================================")
 
 	statusStr := "ОСТАНОВЛЕН"
@@ -349,7 +356,6 @@ func menuStartServer(scanner *bufio.Scanner, dataDir string) {
 		return
 	}
 
-	// Если systemd-службы нет, запускаем бинарник в фоне напрямую
 	snap := loadOfflineUsersSnapshot(dataDir)
 	if len(snap.Users) == 0 {
 		psk := generateRandomPSK()
@@ -426,7 +432,6 @@ func menuStopServer(scanner *bufio.Scanner, dataDir string) {
 	waitForZero(scanner)
 }
 
-// Возвращает true, если бинарник был удалён и нужно выйти из программы
 func menuUninstallServer(scanner *bufio.Scanner, dataDir string) bool {
 	for {
 		fmt.Println("\n==================== УДАЛЕНИЕ СЕРВЕРА ==========================")
@@ -600,12 +605,10 @@ func runNativeSpeedtest() {
 		fmt.Printf("  Пинг     : %.2f ms\n", float64(bestRTT.Microseconds())/1000.0)
 	}
 
-	// Замер Download (4 потока в течение 6 секунд)
 	fmt.Print("  Скачивание (Download)... ")
 	dlMbps := measureSpeedtestDownload(best)
 	fmt.Printf("%.2f Mbps\n", dlMbps)
 
-	// Замер Upload (3 потока в течение 5 секунд)
 	fmt.Print("  Отдача (Upload)...       ")
 	ulMbps := measureSpeedtestUpload(best)
 	fmt.Printf("%.2f Mbps\n", ulMbps)
@@ -703,7 +706,7 @@ func measureSpeedtestUpload(srv speedtestServer) float64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	payload := bytes.Repeat([]byte("0123456789ABCDEF"), 64*1024) // 1 MB
+	payload := bytes.Repeat([]byte("0123456789ABCDEF"), 64*1024)
 	var totalBytes int64
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -747,8 +750,6 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
-
-// --- Вспомогательные функции ---
 
 func generateRandomPSK() string {
 	b := make([]byte, 24)
