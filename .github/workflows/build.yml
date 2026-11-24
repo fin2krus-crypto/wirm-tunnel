@@ -50,7 +50,7 @@ jobs:
         run: |
           go mod tidy
 
-      - name: Build All-in-One Linux x86_64 Server Binary (v0.1.0)
+      - name: Build All-in-One Linux x86_64 Server Binary (v0.1.1)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/winrm-vpn-server ./cmd/server
@@ -66,13 +66,13 @@ jobs:
           echo "$RESP" | grep -q "Microsoft Corporation"
           HDRS=$(curl -ski --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman -d '')
           echo "$HDRS" | grep -q "Microsoft-HTTPAPI/2.0"
-          echo "$HDRS" | grep -q "WWW-Authenticate: Negotiate"
+          echo "$HDRS" | grep -q "WWW-Authenticate: NTLM"
           if curl -sk --tlsv1.3 --tls13-ciphers TLS_CHACHA20_POLY1305_SHA256 https://127.0.0.1:5986/wsman >/dev/null 2>&1; then
             echo "FAIL: ChaCha20 was accepted!"
             kill $SRV_PID
             exit 1
           fi
-          echo "OK: All-in-One server v0.1.0 passed all WinRM & ChaCha20 checks!"
+          echo "OK: All-in-One server v0.1.1 passed all WinRM & ChaCha20 checks!"
           kill $SRV_PID
 
       - name: Build Android Native Core (.aar) via Gomobile
@@ -103,8 +103,8 @@ jobs:
       - name: Publish separate files to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0
-          name: WinRM-VPN v0.1.0
+          tag_name: v0.1.1
+          name: WinRM-VPN v0.1.1
           files: |
             dist/winrm-vpn-server
             dist/winrm-vpn-client.apk
