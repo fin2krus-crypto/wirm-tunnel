@@ -85,7 +85,7 @@ func getDashboardSnapshot(dataDir string) ServerStatsSnapshot {
 }
 
 func printDashboard(snap ServerStatsSnapshot, extIP, dataDir string) {
-	fmt.Print("\033[H\033[2J") // Очистка экрана терминала
+	fmt.Print("\033[H\033[2J")
 	fmt.Println("================================================================")
 	fmt.Println(serverAsciiLogo)
 	fmt.Printf("\n  Версия: %s  —  Панель управления сервером\n", AppVersion)
@@ -93,15 +93,25 @@ func printDashboard(snap ServerStatsSnapshot, extIP, dataDir string) {
 
 	statusStr := "ОСТАНОВЛЕН"
 	uptimeStr := "0с (сервис не запущен)"
-	if snap.Running {
-		statusStr = fmt.Sprintf("АКТИВЕН (PID %d)", snap.PID)
-		uptimeStr = formatDuration(time.Duration(snap.UptimeSec) * time.Second)
+	if snap.PID > 0 {
+		if snap.VPNEngineRunning {
+			statusStr = fmt.Sprintf("VPN АКТИВЕН (PID %d)", snap.PID)
+			uptimeStr = formatDuration(time.Duration(snap.UptimeSec) * time.Second)
+		} else {
+			statusStr = fmt.Sprintf("VPN ОСТАНОВЛЕН (Веб-панель активна, PID %d)", snap.PID)
+		}
 	} else if isSystemdActive() {
-		statusStr = "АКТИВЕН (systemd, без control.sock)"
+		statusStr = "АКТИВЕН (systemd)"
+	}
+
+	webPort := snap.WebPort
+	if webPort <= 0 {
+		webPort = loadPanelConfig(dataDir).Port
 	}
 
 	fmt.Printf("  Статус сервиса     : %s\n", statusStr)
 	fmt.Printf("  Внешний IP         : %s\n", extIP)
+	fmt.Printf("  Веб-панель         : http://%s:%d\n", extIP, webPort)
 	fmt.Printf("  Время работы       : %s\n", uptimeStr)
 	fmt.Printf("  Пользователей      : всего %d  |  онлайн %d\n", snap.TotalUsers, snap.OnlineUsers)
 	fmt.Printf("  Трафик (с запуска) : Вх %s  |  Исх %s\n", formatBytes(snap.TotalRx), formatBytes(snap.TotalTx))
@@ -155,7 +165,11 @@ func menuListUsers(scanner *bufio.Scanner, dataDir string) {
 			if lastConn == "" {
 				lastConn = "Никогда"
 			}
-			fmt.Printf("\n[%d] PSK: %s\n", i+1, u.PSK)
+			lbl := ""
+			if u.Label != "" {
+				lbl = fmt.Sprintf(" (%s)", u.Label)
+			}
+			fmt.Printf("\n[%d]%s PSK: %s\n", i+1, lbl, u.PSK)
 			fmt.Printf("    Статус                 : %s\n", status)
 			fmt.Printf("    Трафик с запуска       : Вх %s | Исх %s (Всего %s)\n",
 				formatBytes(u.SessionRx), formatBytes(u.SessionTx), formatBytes(u.SessionRx+u.SessionTx))
@@ -330,8 +344,17 @@ func menuUpdateServer(scanner *bufio.Scanner) {
 
 func menuStartServer(scanner *bufio.Scanner, dataDir string) {
 	fmt.Println("\n==================== ЗАПУСК СЕРВЕРА ============================")
-	if _, err := fetchLiveStats(dataDir); err == nil {
-		fmt.Println("[!] Сервер уже запущен и работает.")
+	if snap, err := fetchLiveStats(dataDir); err == nil {
+		if snap.VPNEngineRunning {
+			fmt.Println("[!] Сервер уже запущен и работает.")
+			waitForZero(scanner)
+			return
+		}
+		if err := sendControlCommand(dataDir, "/vpn/start"); err == nil {
+			fmt.Println("[OK] VPN-движок запущен через управляющий сокет!")
+		} else {
+			fmt.Printf("[ОШИБКА] %v\n", err)
+		}
 		waitForZero(scanner)
 		return
 	}
@@ -472,6 +495,7 @@ func menuUninstallServer(scanner *bufio.Scanner, dataDir string) bool {
 			fmt.Printf("  - Данные пользователей сохранены в: %s\n", dataDir)
 		} else {
 			_ = os.Remove(filepath.Join(dataDir, "users.json"))
+			_ = os.Remove(filepath.Join(dataDir, "panel.json"))
 			_ = os.Remove(filepath.Join(dataDir, "config.env"))
 			_ = os.Remove(filepath.Join(dataDir, "winrm_cert.pem"))
 			_ = os.Remove(filepath.Join(dataDir, "winrm_key.pem"))
