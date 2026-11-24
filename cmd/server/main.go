@@ -24,23 +24,25 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.2.0"
+const AppVersion = "0.3.0"
 
 //go:embed embedded/winrm-tls-rustls
 var embeddedRustlsBin []byte
 
 func printQuickGuide() {
-	fmt.Printf(`WinRM-VPN Server v%s (All-in-One: Rustls AES-GCM + gVisor Netstack — БЕЗ TUN и БЕЗ root!)
+	fmt.Printf(`WinRM-VPN Server v%s (All-in-One: Rustls + gVisor + Web-Panel :49777)
 
 Короткая инструкция по запуску на Linux (x86_64):
-  1. Откройте порт 5986/TCP в фаерволе:
-       ufw allow 5986/tcp
+  1. Откройте порты в фаерволе:
+       ufw allow 5986/tcp   (WinRM VPN)
+       ufw allow 49777/tcp  (Веб-панель управления)
 
   2. Запустите интерактивное меню управления (без параметров):
        winrm-vpn-server
@@ -49,32 +51,171 @@ func printQuickGuide() {
        winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
      (Несколько ключей можно указать через запятую: -psk "key1,key2")
 
-  4. Скопируйте выведенный Certificate SHA-256 Pin в Android-клиент.
-
-Опционально (если есть root, для полного TCP-отпечатка Windows Server):
-  sysctl -w net.ipv4.tcp_timestamps=0
+  4. Веб-панель управления доступна по адресу:
+       http://<IP_СЕРВЕРА>:49777
 
 Параметры запуска:
-  -listen   string   Внешний адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
+  -listen   string   Внешний адрес и порт VPN (по умолчанию "0.0.0.0:5986")
+  -web-port int      Принудительный порт веб-панели (по умолчанию из panel.json или 49777)
   -psk      string   Ключ или список ключей через запятую
   -daemon            Запуск с использованием пользователей из users.json (без -psk)
-  -data-dir string   Директория хранения users.json, сокета и сертификата
+  -data-dir string   Директория хранения users.json, panel.json, сокета и сертификата
   -cert     string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
   -key      string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
 `, AppVersion)
 }
 
+// VPNEngine управляет жизненным циклом VPN-туннеля (порт 5986 + rustls) независимо от веб-панели
+type VPNEngine struct {
+	mu         sync.Mutex
+	running    bool
+	stopReq    bool
+	listenAddr string
+	certPath   string
+	keyPath    string
+	hostName   string
+	certPin    string
+	statsMgr   *StatsManager
+
+	backendLn net.Listener
+	rustlsCmd *exec.Cmd
+	tmpPath   string
+}
+
+func NewVPNEngine(listenAddr, certPath, keyPath string, statsMgr *StatsManager) *VPNEngine {
+	return &VPNEngine{
+		listenAddr: listenAddr,
+		certPath:   certPath,
+		keyPath:    keyPath,
+		statsMgr:   statsMgr,
+	}
+}
+
+func (e *VPNEngine) Start() error {
+	e.mu.Lock()
+	if e.running {
+		e.mu.Unlock()
+		return nil
+	}
+
+	_, fingerprint, hostName, err := loadOrGenerateWindowsCert(e.certPath, e.keyPath)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("certificate error: %w", err)
+	}
+	e.certPin = fingerprint
+	e.hostName = hostName
+	e.statsMgr.SetMetadata(e.listenAddr, hostName, fingerprint, "", 0)
+
+	backendLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backend listen failed: %w", err)
+	}
+	backendAddr := backendLn.Addr().String()
+
+	rustlsCmd, tmpPath, err := startEmbeddedRustls(e.listenAddr, backendAddr, e.certPath, e.keyPath)
+	if err != nil {
+		_ = backendLn.Close()
+		e.mu.Unlock()
+		return fmt.Errorf("failed to start embedded rustls: %w", err)
+	}
+
+	e.backendLn = backendLn
+	e.rustlsCmd = rustlsCmd
+	e.tmpPath = tmpPath
+	e.stopReq = false
+	e.running = true
+	e.statsMgr.SetVPNRunning(true)
+	e.mu.Unlock()
+
+	go func(cmd *exec.Cmd, tmp string) {
+		err := cmd.Wait()
+		_ = os.Remove(tmp)
+
+		e.mu.Lock()
+		wasExpected := e.stopReq || e.rustlsCmd != cmd
+		if e.rustlsCmd == cmd {
+			e.running = false
+			e.rustlsCmd = nil
+			e.tmpPath = ""
+			if e.backendLn != nil {
+				_ = e.backendLn.Close()
+				e.backendLn = nil
+			}
+			e.statsMgr.SetVPNRunning(false)
+		}
+		e.mu.Unlock()
+
+		if !wasExpected {
+			log.Printf("[ERR] Embedded rustls frontend exited unexpectedly: %v", err)
+		}
+	}(rustlsCmd, tmpPath)
+
+	go func(ln net.Listener, hName string) {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleWinRMConnection(conn, e.statsMgr, hName)
+		}
+	}(backendLn, hostName)
+
+	log.Printf("[VPN] Engine started on %s (Hostname: %s)", e.listenAddr, hostName)
+	return nil
+}
+
+func (e *VPNEngine) Stop() {
+	e.mu.Lock()
+	if !e.running {
+		e.mu.Unlock()
+		return
+	}
+	e.stopReq = true
+	e.running = false
+	ln := e.backendLn
+	cmd := e.rustlsCmd
+	tmp := e.tmpPath
+	e.backendLn = nil
+	e.rustlsCmd = nil
+	e.tmpPath = ""
+	e.mu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		time.Sleep(150 * time.Millisecond)
+		_ = cmd.Process.Kill()
+	}
+	if tmp != "" {
+		_ = os.Remove(tmp)
+	}
+
+	e.statsMgr.SetVPNRunning(false)
+	e.statsMgr.CloseAllActive()
+	log.Printf("[VPN] Engine stopped (Web panel remains online)")
+}
+
+func (e *VPNEngine) Restart() error {
+	e.Stop()
+	time.Sleep(300 * time.Millisecond)
+	return e.Start()
+}
+
 func main() {
-	// При запуске без параметров открываем интерактивное CLI-меню
 	if len(os.Args) == 1 {
 		runInteractiveCLI()
 		return
 	}
 
 	listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM HTTPS listen address")
+	webPortFlag := flag.Int("web-port", 0, "Override web panel port (default 49777 or saved in panel.json)")
 	pskFlag := flag.String("psk", "", "Pre-Shared Key(s), comma-separated")
 	daemonMode := flag.Bool("daemon", false, "Run server using users from users.json")
-	dataDirFlag := flag.String("data-dir", "", "Directory for users.json and control.sock")
+	dataDirFlag := flag.String("data-dir", "", "Directory for users.json, panel.json and control.sock")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
 	keyFile := flag.String("key", "winrm_key.pem", "Path to TLS key")
 	_ = flag.Bool("no-tun", false, "Deprecated (TUN is no longer required)")
@@ -109,42 +250,31 @@ func main() {
 	certPath := resolveAssetPath(*certFile, "winrm_cert.pem", dataDir)
 	keyPath := resolveAssetPath(*keyFile, "winrm_key.pem", dataDir)
 
-	_, fingerprint, hostName, err := loadOrGenerateWindowsCert(certPath, keyPath)
-	if err != nil {
-		log.Fatalf("Certificate error: %v", err)
+	vpnEngine := NewVPNEngine(*listenAddr, certPath, keyPath, statsMgr)
+	if err := vpnEngine.Start(); err != nil {
+		log.Fatalf("Failed to start VPN engine: %v", err)
 	}
 
-	backendLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	webPanel, err := StartWebPanel(dataDir, *webPortFlag, statsMgr, vpnEngine)
 	if err != nil {
-		log.Fatalf("Internal backend listen failed: %v", err)
-	}
-	defer backendLn.Close()
-	backendAddr := backendLn.Addr().String()
-
-	rustlsCmd, tmpPath, err := startEmbeddedRustls(*listenAddr, backendAddr, certPath, keyPath)
-	if err != nil {
-		log.Fatalf("Failed to start embedded rustls frontend: %v", err)
+		log.Printf("[WARN] Веб-панель не запущена: %v", err)
+	} else {
+		log.Printf("[WEB] Веб-панель управления доступна на порту :%d", webPanel.Port())
 	}
 
-	cleanup := func() {
-		statsMgr.FlushAndClose()
-		if rustlsCmd != nil && rustlsCmd.Process != nil {
-			_ = rustlsCmd.Process.Signal(syscall.SIGTERM)
-			_ = rustlsCmd.Wait()
-		}
-		if tmpPath != "" {
-			_ = os.Remove(tmpPath)
-		}
-	}
-	defer cleanup()
+	go func() {
+		extIP := fetchExternalIP()
+		statsMgr.SetMetadata("", "", "", extIP, 0)
+	}()
 
 	shutdownFn := func() {
 		log.Printf("[SYS] Shutting down WinRM-VPN Server v%s...", AppVersion)
-		cleanup()
+		vpnEngine.Stop()
+		statsMgr.FlushAndClose()
 		os.Exit(0)
 	}
 
-	if err := statsMgr.StartControlSocket(shutdownFn); err != nil {
+	if err := statsMgr.StartControlSocket(vpnEngine, shutdownFn); err != nil {
 		log.Printf("[WARN] Control socket not started: %v", err)
 	}
 
@@ -155,28 +285,18 @@ func main() {
 		shutdownFn()
 	}()
 
-	go func() {
-		err := rustlsCmd.Wait()
-		statsMgr.FlushAndClose()
-		_ = os.Remove(tmpPath)
-		log.Fatalf("Embedded rustls frontend exited unexpectedly: %v", err)
-	}()
-
 	log.Printf("================================================================")
-	log.Printf("WinRM-VPN Server v%s (All-in-One: Rustls + gVisor) Ready on %s", AppVersion, *listenAddr)
-	log.Printf("Emulated Windows Hostname: %s", hostName)
-	log.Printf("Loaded PSK keys: %d (DataDir: %s)", len(statsMgr.GetAllPSKs()), dataDir)
-	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
-	log.Printf("%s", fingerprint)
-	log.Printf("================================================================")
-
-	for {
-		conn, err := backendLn.Accept()
-		if err != nil {
-			continue
-		}
-		go handleWinRMConnection(conn, statsMgr, hostName)
+	log.Printf("WinRM-VPN Server v%s Ready on %s", AppVersion, *listenAddr)
+	if webPanel != nil {
+		log.Printf("Web Control Panel : http://0.0.0.0:%d", webPanel.Port())
 	}
+	log.Printf("Emulated Hostname : %s", vpnEngine.hostName)
+	log.Printf("Loaded PSK keys   : %d (DataDir: %s)", len(statsMgr.GetAllPSKs()), dataDir)
+	log.Printf("Certificate SHA-256 Pin (copy to Android/macOS App):")
+	log.Printf("%s", vpnEngine.certPin)
+	log.Printf("================================================================")
+
+	select {}
 }
 
 func resolveAssetPath(val, defaultName, dataDir string) string {
