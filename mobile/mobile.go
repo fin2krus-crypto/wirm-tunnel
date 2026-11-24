@@ -108,9 +108,9 @@ func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha2
 				emitState(cb, "DISCONNECTED")
 				return
 			case <-reconnectChan:
-				emitLog(cb, "[SYS] Reconnect triggered by network change...")
-			case <-time.After(3 * time.Second):
-				emitLog(cb, "[SYS] Reconnecting after 3s...")
+				emitLog(cb, "[SYS] Reconnect triggered immediately...")
+			case <-time.After(2 * time.Second):
+				emitLog(cb, "[SYS] Retrying connection...")
 			}
 		}
 	}()
@@ -136,7 +136,7 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	emitLog(cb, "[TCP] Dialing %s (IPv4)...", serverAddr)
 
 	dialer := &net.Dialer{
-		Timeout: 10 * time.Second,
+		Timeout: 5 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
 			var protectErr error
 			_ = c.Control(func(fd uintptr) {
@@ -163,8 +163,11 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 			activeConn = nil
 		}
 		mu.Unlock()
-		rawConn.Close()
+		_ = rawConn.Close()
 	}()
+
+	// Жёсткий таймаут на весь TLS + NTLM хендшейк (6 сек)
+	_ = rawConn.SetDeadline(time.Now().Add(6 * time.Second))
 
 	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
 	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
@@ -277,6 +280,9 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	if resp2.ContentLength > 0 {
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
 	}
+
+	// Хендшейк пройден — снимаем дедлайн для долгой работы туннеля
+	_ = rawConn.SetDeadline(time.Time{})
 
 	emitLog(cb, "[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
 	emitState(cb, "CONNECTED")
