@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Укажите ваш GitHub репозиторий (можно также переопределить через переменную WINRM_REPO)
-REPO_DEFAULT="YOUR_GITHUB_USER/wirm-tunnel"
+REPO_DEFAULT="n0nam4ik/wirm-tunnel"
 REPO="${WINRM_REPO:-$REPO_DEFAULT}"
 PORT="${WINRM_PORT:-5986}"
 
