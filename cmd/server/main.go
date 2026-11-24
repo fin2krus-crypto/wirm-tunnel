@@ -251,10 +251,12 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 			continue
 		}
 
-		var b64Token string
+		var authScheme, b64Token string
 		if strings.HasPrefix(authHdr, "Negotiate ") {
+			authScheme = "Negotiate"
 			b64Token = strings.TrimSpace(strings.TrimPrefix(authHdr, "Negotiate "))
 		} else if strings.HasPrefix(authHdr, "NTLM ") {
+			authScheme = "NTLM"
 			b64Token = strings.TrimSpace(strings.TrimPrefix(authHdr, "NTLM "))
 		} else {
 			writeWinRM401NoToken(conn)
@@ -265,13 +267,13 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 			var type2B64 string
 			type2B64, currentChallenge = common.BuildNTLMType2(hostName)
 			hasChallenge = true
-			writeWinRM401Type2(conn, type2B64)
+			writeWinRM401Type2(conn, authScheme, type2B64)
 			continue
 		}
 
 		if hasChallenge && strings.HasPrefix(b64Token, "TlRMTVNTUAAD") {
 			if verifyAnyPSK(b64Token, pskList, currentChallenge) {
-				writeWinRM200StreamStart(conn)
+				writeWinRM200StreamStart(conn, req.Host)
 				_ = conn.SetDeadline(time.Time{})
 
 				ns, err := NewClientNetstack(func(pkt []byte) error {
@@ -297,7 +299,7 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 			}
 		}
 
-		writeWinRM401Final(conn)
+		writeWinRM401Final(conn, authScheme)
 		return
 	}
 }
@@ -347,35 +349,36 @@ func writeWinRM401NoToken(w io.Writer) {
 		"WWW-Authenticate: Negotiate\r\n"+
 		"WWW-Authenticate: Kerberos\r\n"+
 		"WWW-Authenticate: CredSSP\r\n"+
+		"WWW-Authenticate: NTLM\r\n"+
 		"Date: %s\r\n"+
 		"Content-Length: 0\r\n\r\n",
 		common.ServerHeader, httpDate())
 	_, _ = io.WriteString(w, resp)
 }
 
-func writeWinRM401Type2(w io.Writer, type2B64 string) {
+func writeWinRM401Type2(w io.Writer, scheme string, type2B64 string) {
 	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
 		"Server: %s\r\n"+
-		"WWW-Authenticate: Negotiate %s\r\n"+
+		"WWW-Authenticate: %s %s\r\n"+
 		"Date: %s\r\n"+
 		"Content-Length: 0\r\n\r\n",
-		common.ServerHeader, type2B64, httpDate())
+		common.ServerHeader, scheme, type2B64, httpDate())
 	_, _ = io.WriteString(w, resp)
 }
 
-func writeWinRM401Final(w io.Writer) {
+func writeWinRM401Final(w io.Writer, scheme string) {
 	resp := fmt.Sprintf("HTTP/1.1 401 Unauthorized\r\n"+
 		"Server: %s\r\n"+
-		"WWW-Authenticate: Negotiate\r\n"+
+		"WWW-Authenticate: %s\r\n"+
 		"Date: %s\r\n"+
 		"Connection: close\r\n"+
 		"Content-Length: 0\r\n\r\n",
-		common.ServerHeader, httpDate())
+		common.ServerHeader, scheme, httpDate())
 	_, _ = io.WriteString(w, resp)
 }
 
-func writeWinRM200StreamStart(w io.Writer) {
-	soap := common.FakeSoapCreateShellResponseXML
+func writeWinRM200StreamStart(w io.Writer, hostAddr string) {
+	soap := common.BuildSoapCreateShellResponseXML(hostAddr)
 	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
 		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
 		"Server: %s\r\n"+
