@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ type SocketProtector interface {
 type TunnelCallback interface {
 	OnLog(msg string)
 	OnStateChanged(state string)
+	OpenTun() int
 }
 
 var (
@@ -37,6 +39,8 @@ var (
 	reconnectChan chan struct{}
 	activeConn    net.Conn
 )
+
+const maxConnectAttempts = 3
 
 func emitLog(cb TunnelCallback, format string, args ...any) {
 	if cb != nil {
@@ -66,7 +70,7 @@ func TriggerReconnect() {
 	}
 }
 
-func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha256 string, protector SocketProtector, cb TunnelCallback) error {
+func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, protector SocketProtector, cb TunnelCallback) error {
 	mu.Lock()
 	if running {
 		mu.Unlock()
@@ -75,42 +79,125 @@ func StartWinRMTunnel(tunFd int, serverAddr string, psk string, expectedCertSha2
 	running = true
 	stopChan = make(chan struct{})
 	reconnectChan = make(chan struct{}, 1)
+	localStop := stopChan
+	localReconn := reconnectChan
 	mu.Unlock()
 
 	expectedPin := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(expectedCertSha256), ":", ""))
 
 	go func() {
-		dupFd, err := syscall.Dup(tunFd)
-		if err != nil {
-			emitLog(cb, "[ERR] syscall.Dup(tunFd) failed: %v", err)
-			emitState(cb, "ERROR")
-			return
-		}
-		tunFile := os.NewFile(uintptr(dupFd), "tun")
-		defer tunFile.Close()
+		var tunFile *os.File
+		tunRxCh := make(chan []byte, 128)
 
+		defer func() {
+			if tunFile != nil {
+				_ = tunFile.Close()
+			}
+		}()
+
+		// Поднимает TUN-интерфейс на стороне Android только после успешного подключения к серверу
+		ensureTun := func() (*os.File, error) {
+			if tunFile != nil {
+				return tunFile, nil
+			}
+			if cb == nil {
+				return nil, errors.New("TunnelCallback is nil")
+			}
+			fd := cb.OpenTun()
+			if fd < 0 {
+				return nil, errors.New("не удалось поднять TUN интерфейс Android")
+			}
+			dupFd, err := syscall.Dup(fd)
+			if err != nil {
+				return nil, fmt.Errorf("syscall.Dup(tunFd) failed: %w", err)
+			}
+			_ = syscall.SetNonblock(dupFd, true)
+			tunFile = os.NewFile(uintptr(dupFd), "tun")
+
+			// Единственная горутина чтения TUN на всё время жизни сервиса
+			go func(tf *os.File) {
+				buf := make([]byte, 2048)
+				for {
+					n, err := tf.Read(buf)
+					if err != nil {
+						return
+					}
+					if n >= 20 && (buf[0]>>4) == 4 {
+						pkt := make([]byte, n)
+						copy(pkt, buf[:n])
+						select {
+						case tunRxCh <- pkt:
+						default:
+							select {
+							case <-tunRxCh:
+							default:
+							}
+							select {
+							case tunRxCh <- pkt:
+							default:
+							}
+						}
+					}
+				}
+			}(tunFile)
+
+			return tunFile, nil
+		}
+
+		attempt := 0
 		for {
 			select {
-			case <-stopChan:
+			case <-localStop:
 				emitState(cb, "DISCONNECTED")
 				return
 			default:
 			}
 
+			attempt++
+			emitLog(cb, "[SYS] Попытка подключения %d/%d...", attempt, maxConnectAttempts)
 			emitState(cb, "CONNECTING")
-			err := runSingleSession(tunFile, serverAddr, psk, expectedPin, protector, cb)
+
+			wasConnected, err := runSingleSession(serverAddr, psk, expectedPin, protector, cb, ensureTun, tunRxCh, localStop)
 			if err != nil {
 				emitLog(cb, "[ERR] Session ended: %v", err)
 			}
+			if wasConnected {
+				// Если сессия была активна и оборвалась позже — сбрасываем счётчик попыток
+				attempt = 0
+			}
 
 			select {
-			case <-stopChan:
+			case <-localStop:
 				emitState(cb, "DISCONNECTED")
 				return
-			case <-reconnectChan:
-				emitLog(cb, "[SYS] Reconnect triggered immediately...")
-			case <-time.After(2 * time.Second):
-				emitLog(cb, "[SYS] Retrying connection...")
+			default:
+			}
+
+			if attempt >= maxConnectAttempts {
+				emitLog(cb, "[ERR] Исчерпан лимит попыток подключения (%d/%d). Остановка VPN...", attempt, maxConnectAttempts)
+				mu.Lock()
+				if running {
+					running = false
+					close(stopChan)
+					reconnectChan = nil
+				}
+				mu.Unlock()
+				emitState(cb, "ERROR")
+				return
+			}
+
+			// Случайная задержка от 2.0 до 6.0 секунд перед следующей попыткой
+			delayMs := 2000 + mathrand.Intn(4001)
+			emitLog(cb, "[SYS] Повторная попытка через %.1f сек...", float64(delayMs)/1000.0)
+
+			select {
+			case <-localStop:
+				emitState(cb, "DISCONNECTED")
+				return
+			case <-localReconn:
+				attempt = 0
+				emitLog(cb, "[SYS] Переключение сети — немедленный сброс счётчика и переподключение...")
+			case <-time.After(time.Duration(delayMs) * time.Millisecond):
 			}
 		}
 	}()
@@ -132,11 +219,18 @@ func StopWinRMTunnel() {
 	reconnectChan = nil
 }
 
-func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, protector SocketProtector, cb TunnelCallback) error {
+func runSingleSession(
+	serverAddr, psk, expectedPin string,
+	protector SocketProtector,
+	cb TunnelCallback,
+	ensureTun func() (*os.File, error),
+	tunRxCh <-chan []byte,
+	localStop <-chan struct{},
+) (bool, error) {
 	emitLog(cb, "[TCP] Dialing %s (IPv4)...", serverAddr)
 
 	dialer := &net.Dialer{
-		Timeout: 5 * time.Second,
+		Timeout: 4 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
 			var protectErr error
 			_ = c.Control(func(fd uintptr) {
@@ -150,7 +244,7 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	rawConn, err := dialer.Dial("tcp4", serverAddr)
 	if err != nil {
-		return fmt.Errorf("TCP connect failed: %w", err)
+		return false, fmt.Errorf("TCP connect failed: %w", err)
 	}
 
 	mu.Lock()
@@ -166,8 +260,8 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		_ = rawConn.Close()
 	}()
 
-	// Таймаут на весь TLS + 3-шаговый NTLM хендшейк (6 сек)
-	_ = rawConn.SetDeadline(time.Now().Add(6 * time.Second))
+	// Ограничение 5 сек на TLS + 3-шаговый NTLM хендшейк
+	_ = rawConn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
 	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
@@ -178,17 +272,17 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
 
 	if err := uConn.ApplyPreset(buildAnsibleLinuxOpenSSL3Spec()); err != nil {
-		return fmt.Errorf("uTLS preset error: %w", err)
+		return false, fmt.Errorf("uTLS preset error: %w", err)
 	}
 	if err := uConn.Handshake(); err != nil {
-		return fmt.Errorf("TLS handshake failed: %w", err)
+		return false, fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
 	state := uConn.ConnectionState()
 	emitLog(cb, "[TLS] Handshake OK (Version: 0x%x, Cipher: %s)", state.Version, tls.CipherSuiteName(state.CipherSuite))
 
 	if len(state.PeerCertificates) == 0 {
-		return errors.New("server provided no certificate")
+		return false, errors.New("server provided no certificate")
 	}
 	h := sha256.Sum256(state.PeerCertificates[0].Raw)
 	gotPin := hex.EncodeToString(h[:])
@@ -196,7 +290,7 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	if expectedPin != "" {
 		if gotPin != expectedPin {
-			return fmt.Errorf("Certificate Pin mismatch! Expected %s..., got %s...", expectedPin[:12], gotPin[:12])
+			return false, fmt.Errorf("Certificate Pin mismatch! Expected %s..., got %s...", expectedPin[:12], gotPin[:12])
 		}
 		emitLog(cb, "[TLS] Certificate Pin verified OK")
 	} else {
@@ -205,10 +299,9 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	br := bufio.NewReader(uConn)
 
-	// Генерируем уникальный SOAP-запрос Create Shell со случайной длиной
 	soapBody := common.BuildSoapCreateShellXML(serverAddr)
 
-	// Шаг 1/3 (как в Ansible pywinrm / requests-ntlm): POST /wsman БЕЗ заголовка Authorization
+	// Шаг 1/3: POST /wsman без заголовка Authorization
 	emitLog(cb, "[HTTP 1/3] -> POST %s (no auth, SOAP %dB)", common.WinRMPath, len(soapBody))
 	req0 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
@@ -221,22 +314,22 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, len(soapBody), soapBody)
 
 	if _, err := io.WriteString(uConn, req0); err != nil {
-		return fmt.Errorf("HTTP step 1/3 write failed: %w", err)
+		return false, fmt.Errorf("HTTP step 1/3 write failed: %w", err)
 	}
 
 	resp0, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return fmt.Errorf("HTTP step 1/3 read failed: %w", err)
+		return false, fmt.Errorf("HTTP step 1/3 read failed: %w", err)
 	}
 	_, _ = io.Copy(io.Discard, resp0.Body)
 	_ = resp0.Body.Close()
 
 	emitLog(cb, "[HTTP 1/3] <- %s (Server: %s)", resp0.Status, resp0.Header.Get("Server"))
 	if resp0.StatusCode != 401 {
-		return fmt.Errorf("expected 401 on step 1/3, got %d", resp0.StatusCode)
+		return false, fmt.Errorf("expected 401 on step 1/3, got %d", resp0.StatusCode)
 	}
 
-	// Шаг 2/3: POST /wsman с Authorization: NTLM <Type 1> и пустым телом
+	// Шаг 2/3: POST /wsman с Authorization: NTLM <Type 1>
 	emitLog(cb, "[HTTP 2/3] -> POST %s (Authorization: NTLM Type 1)", common.WinRMPath)
 	t1 := common.BuildNTLMType1()
 	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
@@ -251,19 +344,19 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t1)
 
 	if _, err := io.WriteString(uConn, req1); err != nil {
-		return fmt.Errorf("HTTP step 2/3 write failed: %w", err)
+		return false, fmt.Errorf("HTTP step 2/3 write failed: %w", err)
 	}
 
 	resp1, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return fmt.Errorf("HTTP step 2/3 read failed: %w", err)
+		return false, fmt.Errorf("HTTP step 2/3 read failed: %w", err)
 	}
 	_, _ = io.Copy(io.Discard, resp1.Body)
 	_ = resp1.Body.Close()
 
 	emitLog(cb, "[HTTP 2/3] <- %s", resp1.Status)
 	if resp1.StatusCode != 401 {
-		return fmt.Errorf("expected 401 Unauthorized on step 2/3, got %d", resp1.StatusCode)
+		return false, fmt.Errorf("expected 401 Unauthorized on step 2/3, got %d", resp1.StatusCode)
 	}
 
 	var serverChallenge [8]byte
@@ -284,7 +377,7 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		}
 	}
 	if !foundChallenge {
-		return errors.New("server did not return NTLM Type 2 Challenge")
+		return false, errors.New("server did not return NTLM Type 2 Challenge")
 	}
 	emitLog(cb, "[NTLM] Received Type 2 Challenge: %s", hex.EncodeToString(serverChallenge[:]))
 
@@ -303,16 +396,16 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t3, len(soapBody), soapBody)
 
 	if _, err := io.WriteString(uConn, req2); err != nil {
-		return fmt.Errorf("HTTP step 3/3 write failed: %w", err)
+		return false, fmt.Errorf("HTTP step 3/3 write failed: %w", err)
 	}
 
 	resp2, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return fmt.Errorf("HTTP step 3/3 read failed: %w", err)
+		return false, fmt.Errorf("HTTP step 3/3 read failed: %w", err)
 	}
 	emitLog(cb, "[HTTP 3/3] <- %s (SOAP %dB)", resp2.Status, resp2.ContentLength)
 	if resp2.StatusCode != 200 {
-		return fmt.Errorf("auth rejected (%d) — проверьте PSK или системное время!", resp2.StatusCode)
+		return false, fmt.Errorf("auth rejected (%d) — проверьте PSK или системное время!", resp2.StatusCode)
 	}
 	if resp2.ContentLength > 0 {
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
@@ -320,39 +413,58 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	_ = rawConn.SetDeadline(time.Time{})
 
+	// Соединение с сервером успешно установлено — только теперь поднимаем Android TUN!
+	tf, err := ensureTun()
+	if err != nil {
+		return false, err
+	}
+
 	emitLog(cb, "[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
 	emitState(cb, "CONNECTED")
 
+	sessionDone := make(chan struct{})
+	defer close(sessionDone)
+
 	errCh := make(chan error, 2)
 
+	// TUN -> Сервер
 	go func() {
-		buf := make([]byte, 2048)
 		for {
-			n, err := tunFile.Read(buf)
-			if err != nil {
-				errCh <- fmt.Errorf("TUN read error: %w", err)
+			select {
+			case <-sessionDone:
 				return
-			}
-			if n >= 20 && (buf[0]>>4) == 4 {
-				if err := common.WritePaddedFrame(uConn, buf[:n]); err != nil {
-					errCh <- fmt.Errorf("tunnel write error: %w", err)
+			case <-localStop:
+				return
+			case pkt := <-tunRxCh:
+				if err := common.WritePaddedFrame(uConn, pkt); err != nil {
+					select {
+					case errCh <- fmt.Errorf("tunnel write error: %w", err):
+					default:
+					}
 					return
 				}
 			}
 		}
 	}()
 
+	// Сервер -> TUN
 	go func() {
 		scratch := make([]byte, 65536)
 		for {
 			pkt, err := common.ReadPaddedFrame(br, scratch)
 			if err != nil {
-				errCh <- fmt.Errorf("tunnel read error: %w", err)
+				select {
+				case errCh <- fmt.Errorf("tunnel read error: %w", err):
+				default:
+				}
 				return
 			}
 			if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
-				if _, err := tunFile.Write(pkt); err != nil {
-					errCh <- fmt.Errorf("TUN write error: %w", err)
+				if _, err := tf.Write(pkt); err != nil {
+					select {
+					case errCh <- fmt.Errorf("TUN write error: %w", err):
+					default:
+					}
 					return
 				}
 			}
@@ -360,11 +472,11 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	}()
 
 	select {
-	case <-stopChan:
+	case <-localStop:
 		emitLog(cb, "[VPN] Stopped by user.")
-		return nil
+		return true, nil
 	case err := <-errCh:
-		return err
+		return true, err
 	}
 }
 
