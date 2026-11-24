@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Linux Server v0.2.0 + Android v0.1.1 + macOS Universal v0.1.1)
+name: Build WinRM VPN (Linux Server v0.3.0 + Android v0.1.1 + macOS Universal v0.1.1)
 
 on:
   push:
@@ -48,10 +48,31 @@ jobs:
         run: |
           go mod tidy
 
-      - name: Build All-in-One Linux x86_64 Server Binary (v0.2.0)
+      - name: Build All-in-One Linux x86_64 Server Binary (v0.3.0)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/winrm-vpn-server ./cmd/server
+
+      - name: Smoke-test Binary (WinRM, ChaCha20 Rejection & Web Panel :49777)
+        run: |
+          ./dist/winrm-vpn-server -listen 0.0.0.0:5986 -psk "test-secret-key" &
+          SRV_PID=$!
+          sleep 2
+          RESP=$(curl -sk --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman \
+            -H "Content-Type: application/soap+xml;charset=UTF-8" \
+            -d '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"><s:Header/><s:Body><wsmid:Identify/></s:Body></s:Envelope>')
+          echo "$RESP" | grep -q "Microsoft Corporation"
+          HDRS=$(curl -ski --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman -d '')
+          echo "$HDRS" | grep -q "Microsoft-HTTPAPI/2.0"
+          echo "$HDRS" | grep -q "WWW-Authenticate: NTLM"
+          if curl -sk --tlsv1.3 --tls13-ciphers TLS_CHACHA20_POLY1305_SHA256 https://127.0.0.1:5986/wsman >/dev/null 2>&1; then
+            echo "FAIL: ChaCha20 was accepted!"
+            kill $SRV_PID
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.3.0"'
+          echo "OK: Server v0.3.0 passed WinRM, ChaCha20 & Web Panel checks!"
+          kill $SRV_PID
 
       - name: Build Android Native Core (.aar) via Gomobile
         env:
@@ -133,11 +154,11 @@ jobs:
           path: release_files
           merge-multiple: true
 
-      - name: Publish all binaries to GitHub Release
+      - name: Publish all binaries to GitHub Release v0.3.0
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.2.0
-          name: WinRM-VPN (Server v0.2.0 / Android & macOS v0.1.1)
+          tag_name: v0.3.0
+          name: WinRM-VPN v0.3.0 (Server v0.3.0 / Clients v0.1.1)
           files: |
             release_files/winrm-vpn-server
             release_files/winrm-vpn-client.apk
