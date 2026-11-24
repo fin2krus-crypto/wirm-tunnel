@@ -62,12 +62,12 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
 
     @Volatile private var isStopping = false
 
-    // Таймер автовыключения VPN, если за 10 секунд не удалось установить соединение
+    // Страховочный таймер на все 3 попытки (45 сек)
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var isConnectTimeoutArmed = false
     private val connectTimeoutRunnable = Runnable {
         if (!isStopping && VpnStateBus.currentState != "CONNECTED") {
-            VpnStateBus.log("[TIMEOUT] Не удалось установить соединение за 10 секунд. Выключение VPN...")
+            VpnStateBus.log("[TIMEOUT] Превышено общее время подключения. Выключение сервиса...")
             stopVpn(dueToError = true)
         }
     }
@@ -87,7 +87,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         val psk = intent.getStringExtra("psk") ?: return START_NOT_STICKY
         val certPin = intent.getStringExtra("pin") ?: ""
 
-        // Загружаем сохранённую настройку переключателя (важно при запуске из шторки)
         val prefs = getSharedPreferences("winrm_cfg", Context.MODE_PRIVATE)
         VpnStateBus.checkConnectionEnabled = prefs.getBoolean("check_conn", false)
 
@@ -97,9 +96,27 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         startHealthCheckLoop()
         armConnectTimeoutIfNeeded()
 
-        VpnStateBus.log("[ANDROID] Initializing TUN interface (10.88.0.2/24, MTU 1380)...")
+        VpnStateBus.log("[ANDROID] Подключение к серверу (TUN поднимется только после успеха)...")
+        try {
+            Mobile.startWinRMTunnel(serverAddr, psk, certPin, this, this)
+        } catch (e: Exception) {
+            if (e.message?.contains("already running") == true) {
+                VpnStateBus.log("[ANDROID] Туннель уже запущен.")
+                return START_STICKY
+            }
+            VpnStateBus.log("[ERR] StartWinRMTunnel exception: ${e.message}")
+            stopVpn(dueToError = true)
+        }
 
+        return START_STICKY
+    }
+
+    // Вызывается из Go только ПОСЛЕ успешной авторизации (200 OK)
+    @Synchronized
+    override fun openTun(): Long {
+        if (isStopping) return -1L
         if (vpnInterface == null) {
+            VpnStateBus.log("[ANDROID] Соединение успешно! Поднимаю TUN интерфейс (10.88.0.2/24, MTU 1380)...")
             val builder = Builder()
                 .setSession("WinRM-VPN")
                 .setMtu(1380)
@@ -115,26 +132,17 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         val pfd = vpnInterface
         if (pfd == null) {
             VpnStateBus.log("[ERR] Failed to establish Android VpnService TUN!")
-            stopVpn(dueToError = true)
-            return START_NOT_STICKY
+            return -1L
         }
-
-        VpnStateBus.log("[ANDROID] TUN fd=${pfd.fd} ready. Starting Go core...")
-        try {
-            Mobile.startWinRMTunnel(pfd.fd.toLong(), serverAddr, psk, certPin, this, this)
-        } catch (e: Exception) {
-            VpnStateBus.log("[ERR] StartWinRMTunnel exception: ${e.message}")
-            stopVpn(dueToError = true)
-        }
-
-        return START_STICKY
+        VpnStateBus.log("[ANDROID] TUN fd=${pfd.fd} активен.")
+        return pfd.fd.toLong()
     }
 
     private fun armConnectTimeoutIfNeeded() {
         mainHandler.post {
             if (!isStopping && !isConnectTimeoutArmed) {
                 isConnectTimeoutArmed = true
-                mainHandler.postDelayed(connectTimeoutRunnable, 10_000L)
+                mainHandler.postDelayed(connectTimeoutRunnable, 45_000L)
             }
         }
     }
@@ -237,7 +245,11 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (lastNetwork != network) {
+                if (lastNetwork == null) {
+                    // Первичная фиксация текущей сети без лишнего сброса соединения
+                    lastNetwork = network
+                    VpnStateBus.log("[NETWORK] Active network detected ($network).")
+                } else if (lastNetwork != network) {
                     VpnStateBus.log("[NETWORK] Validated network changed ($network). Forcing reconnect...")
                     lastNetwork = network
                     Mobile.triggerReconnect()
@@ -283,11 +295,17 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         when (state) {
             "CONNECTED" -> cancelConnectTimeout()
             "CONNECTING" -> armConnectTimeoutIfNeeded()
+            "ERROR" -> {
+                mainHandler.post { stopVpn(dueToError = true) }
+                return
+            }
         }
         VpnStateBus.updateState(state)
     }
 
+    @Synchronized
     private fun stopVpn(dueToError: Boolean = false) {
+        if (isStopping) return
         isStopping = true
         cancelConnectTimeout()
         stopHealthCheckLoop()
@@ -317,14 +335,14 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("WinRM-VPN v0.1.0")
+                .setContentTitle("WinRM-VPN v0.1.1")
                 .setContentText("Should looks like Ansible")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("WinRM-VPN v0.1.0")
+                .setContentTitle("WinRM-VPN v0.1.1")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         }
