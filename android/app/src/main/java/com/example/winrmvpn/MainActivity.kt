@@ -1,5 +1,6 @@
 package com.example.winrmvpn
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
@@ -10,6 +11,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -40,12 +42,15 @@ class MainActivity : Activity() {
 
     private val logListener: (String) -> Unit = { line ->
         runOnUiThread {
+            val wasAtBottom = !logScroll.canScrollVertically(1)
             if (logText.text.isNotEmpty()) {
                 logText.append("\n$line")
             } else {
                 logText.text = line
             }
-            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+            if (wasAtBottom) {
+                logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+            }
         }
     }
 
@@ -63,6 +68,7 @@ __        ___       ____  __  __    __     ______  _   _
    \_/\_/  |_|_| |_|_| \_\_|  |_|      \_/  |_|   |_| \_|
     """.trimIndent()
 
+    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -116,7 +122,6 @@ __        ___       ____  __  __    __     ______  _   _
             setHintTextColor(Color.parseColor("#78909C"))
         }
 
-        // Переключатель "Проверять соединение" + кнопка (?)
         val checkRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -247,7 +252,7 @@ __        ___       ____  __  __    __     ______  _   _
             gravity = Gravity.CENTER_VERTICAL
         }
         val logTitle = TextView(this).apply {
-            text = "Логи подключения:"
+            text = "Логи подключения (прокручиваемые):"
             textSize = 13f
             setTextColor(Color.parseColor("#B0BEC5"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -271,12 +276,25 @@ __        ___       ____  __  __    __     ______  _   _
             text = VpnStateBus.logs.joinToString("\n")
         }
 
+        // Разрешаем независимую прокрутку лога внутри внешнего ScrollView
         logScroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#0D1117"))
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false
+            isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                520
+                600
             )
+            setOnTouchListener { v, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        v.parent?.requestDisallowInterceptTouchEvent(false)
+                }
+                false
+            }
             addView(logText)
         }
 
@@ -302,6 +320,7 @@ __        ___       ____  __  __    __     ______  _   _
         VpnStateBus.stateListeners.add(stateListener)
 
         applyStateUi(VpnStateBus.currentState)
+        logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     override fun onDestroy() {
