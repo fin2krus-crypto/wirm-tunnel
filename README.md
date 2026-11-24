@@ -6,7 +6,7 @@ IPv4-туннель. Проект реализует стелс-мимикрию
 
 - **Сервер:** Единый статический бинарник для Linux `x86_64` (Go-бэкенд с userspace TCP/IP стеком gVisor + встроенный фронтенд на Rustls). **Не требует root-прав, не требует `/dev/net/tun` и не требует настройки `iptables`/NAT**
 
-- **Клиент:** Android APK (`VpnService` + Go-ядро с кастомным `uTLS` под профиль Linux OpenSSL 3.x).
+- **Клиент:** Android APK (`VpnService` + Go-ядро с кастомным `uTLS` под профиль Linux OpenSSL 3.x). и характерным для Ansible набором шифров при установлении TLS соединения
 
 ---
 
@@ -16,6 +16,13 @@ IPv4-туннель. Проект реализует стелс-мимикрию
 ```bash
 curl -fsSL https://raw.githubusercontent.com/n0nam4ik/wirm-tunnel/main/install.sh | sudo bash
 ```
+
+## Обновление до последней версии
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/n0nam4ik/wirm-tunnel/main/update.sh | sudo bash
+```
+
 ---
 ## Ключевые особенности и маскировка
 
