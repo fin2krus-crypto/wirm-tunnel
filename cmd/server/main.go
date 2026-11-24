@@ -29,7 +29,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.1.0"
+const AppVersion = "0.1.1"
 
 //go:embed embedded/winrm-tls-rustls
 var embeddedRustlsBin []byte
