@@ -166,7 +166,7 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		_ = rawConn.Close()
 	}()
 
-	// Жёсткий таймаут на весь TLS + NTLM хендшейк (6 сек)
+	// Таймаут на весь TLS + 3-шаговый NTLM хендшейк (6 сек)
 	_ = rawConn.SetDeadline(time.Now().Add(6 * time.Second))
 
 	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
@@ -205,7 +205,39 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 
 	br := bufio.NewReader(uConn)
 
-	emitLog(cb, "[HTTP] -> POST %s (NTLM Type 1)", common.WinRMPath)
+	// Генерируем уникальный SOAP-запрос Create Shell со случайной длиной
+	soapBody := common.BuildSoapCreateShellXML(serverAddr)
+
+	// Шаг 1/3 (как в Ansible pywinrm / requests-ntlm): POST /wsman БЕЗ заголовка Authorization
+	emitLog(cb, "[HTTP 1/3] -> POST %s (no auth, SOAP %dB)", common.WinRMPath, len(soapBody))
+	req0 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"User-Agent: %s\r\n"+
+		"Accept-Encoding: gzip, deflate\r\n"+
+		"Accept: */*\r\n"+
+		"Connection: keep-alive\r\n"+
+		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+		"Content-Length: %d\r\n\r\n%s",
+		common.WinRMPath, serverAddr, common.WinRMUserAgent, len(soapBody), soapBody)
+
+	if _, err := io.WriteString(uConn, req0); err != nil {
+		return fmt.Errorf("HTTP step 1/3 write failed: %w", err)
+	}
+
+	resp0, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return fmt.Errorf("HTTP step 1/3 read failed: %w", err)
+	}
+	_, _ = io.Copy(io.Discard, resp0.Body)
+	_ = resp0.Body.Close()
+
+	emitLog(cb, "[HTTP 1/3] <- %s (Server: %s)", resp0.Status, resp0.Header.Get("Server"))
+	if resp0.StatusCode != 401 {
+		return fmt.Errorf("expected 401 on step 1/3, got %d", resp0.StatusCode)
+	}
+
+	// Шаг 2/3: POST /wsman с Authorization: NTLM <Type 1> и пустым телом
+	emitLog(cb, "[HTTP 2/3] -> POST %s (Authorization: NTLM Type 1)", common.WinRMPath)
 	t1 := common.BuildNTLMType1()
 	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
@@ -214,31 +246,36 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		"Accept: */*\r\n"+
 		"Connection: keep-alive\r\n"+
 		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Authorization: Negotiate %s\r\n"+
+		"Authorization: NTLM %s\r\n"+
 		"Content-Length: 0\r\n\r\n",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t1)
 
 	if _, err := io.WriteString(uConn, req1); err != nil {
-		return fmt.Errorf("HTTP step 1 write failed: %w", err)
+		return fmt.Errorf("HTTP step 2/3 write failed: %w", err)
 	}
 
 	resp1, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return fmt.Errorf("HTTP step 1 read failed: %w", err)
+		return fmt.Errorf("HTTP step 2/3 read failed: %w", err)
 	}
 	_, _ = io.Copy(io.Discard, resp1.Body)
 	_ = resp1.Body.Close()
 
-	emitLog(cb, "[HTTP] <- %s (Server: %s)", resp1.Status, resp1.Header.Get("Server"))
+	emitLog(cb, "[HTTP 2/3] <- %s", resp1.Status)
 	if resp1.StatusCode != 401 {
-		return fmt.Errorf("expected 401 Unauthorized on step 1, got %d", resp1.StatusCode)
+		return fmt.Errorf("expected 401 Unauthorized on step 2/3, got %d", resp1.StatusCode)
 	}
 
 	var serverChallenge [8]byte
 	foundChallenge := false
 	for _, hdr := range resp1.Header.Values("WWW-Authenticate") {
-		if strings.HasPrefix(hdr, "Negotiate ") {
-			b64 := strings.TrimSpace(strings.TrimPrefix(hdr, "Negotiate "))
+		var b64 string
+		if strings.HasPrefix(hdr, "NTLM ") {
+			b64 = strings.TrimSpace(strings.TrimPrefix(hdr, "NTLM "))
+		} else if strings.HasPrefix(hdr, "Negotiate ") {
+			b64 = strings.TrimSpace(strings.TrimPrefix(hdr, "Negotiate "))
+		}
+		if b64 != "" {
 			raw, err := base64.StdEncoding.DecodeString(b64)
 			if err == nil && len(raw) >= 32 {
 				copy(serverChallenge[:], raw[24:32])
@@ -251,9 +288,9 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 	}
 	emitLog(cb, "[NTLM] Received Type 2 Challenge: %s", hex.EncodeToString(serverChallenge[:]))
 
-	emitLog(cb, "[HTTP] -> POST %s (NTLM Type 3 + Covert HMAC + SOAP)", common.WinRMPath)
+	// Шаг 3/3: POST /wsman с Authorization: NTLM <Type 3 + HMAC> и телом SOAP Create Shell
+	emitLog(cb, "[HTTP 3/3] -> POST %s (Authorization: NTLM Type 3 + SOAP)", common.WinRMPath)
 	t3 := common.BuildNTLMType3WithAuth(psk, serverChallenge)
-	soapBody := common.FakeSoapCreateShellXML
 	req2 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"User-Agent: %s\r\n"+
@@ -261,19 +298,19 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		"Accept: */*\r\n"+
 		"Connection: keep-alive\r\n"+
 		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Authorization: Negotiate %s\r\n"+
+		"Authorization: NTLM %s\r\n"+
 		"Content-Length: %d\r\n\r\n%s",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t3, len(soapBody), soapBody)
 
 	if _, err := io.WriteString(uConn, req2); err != nil {
-		return fmt.Errorf("HTTP step 2 write failed: %w", err)
+		return fmt.Errorf("HTTP step 3/3 write failed: %w", err)
 	}
 
 	resp2, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return fmt.Errorf("HTTP step 2 read failed: %w", err)
+		return fmt.Errorf("HTTP step 3/3 read failed: %w", err)
 	}
-	emitLog(cb, "[HTTP] <- %s", resp2.Status)
+	emitLog(cb, "[HTTP 3/3] <- %s (SOAP %dB)", resp2.Status, resp2.ContentLength)
 	if resp2.StatusCode != 200 {
 		return fmt.Errorf("auth rejected (%d) — проверьте PSK или системное время!", resp2.StatusCode)
 	}
@@ -281,7 +318,6 @@ func runSingleSession(tunFile *os.File, serverAddr, psk, expectedPin string, pro
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
 	}
 
-	// Хендшейк пройден — снимаем дедлайн для долгой работы туннеля
 	_ = rawConn.SetDeadline(time.Time{})
 
 	emitLog(cb, "[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
