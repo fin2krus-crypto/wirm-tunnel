@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -29,7 +30,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.1.1"
+const AppVersion = "0.2.0"
 
 //go:embed embedded/winrm-tls-rustls
 var embeddedRustlsBin []byte
@@ -41,13 +42,12 @@ func printQuickGuide() {
   1. Откройте порт 5986/TCP в фаерволе:
        ufw allow 5986/tcp
 
-  2. Сгенерируйте секретный ключ (PSK):
-       openssl rand -hex 24
+  2. Запустите интерактивное меню управления (без параметров):
+       winrm-vpn-server
 
-  3. Запустите единый бинарник (root и iptables НЕ требуются):
+  3. Или запустите сервер напрямую параметрами:
        winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
-
-     (Для нескольких пользователей укажите ключи через запятую: -psk "key1,key2")
+     (Несколько ключей можно указать через запятую: -psk "key1,key2")
 
   4. Скопируйте выведенный Certificate SHA-256 Pin в Android-клиент.
 
@@ -55,41 +55,61 @@ func printQuickGuide() {
   sysctl -w net.ipv4.tcp_timestamps=0
 
 Параметры запуска:
-  -listen string   Внешний адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
-  -psk    string   Ключ или список ключей через запятую (обязательно)
-  -cert   string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
-  -key    string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
+  -listen   string   Внешний адрес и порт прослушивания (по умолчанию "0.0.0.0:5986")
+  -psk      string   Ключ или список ключей через запятую
+  -daemon            Запуск с использованием пользователей из users.json (без -psk)
+  -data-dir string   Директория хранения users.json, сокета и сертификата
+  -cert     string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
+  -key      string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
 `, AppVersion)
 }
 
 func main() {
+	// При запуске без параметров открываем интерактивное CLI-меню
 	if len(os.Args) == 1 {
-		printQuickGuide()
-		os.Exit(0)
+		runInteractiveCLI()
+		return
 	}
 
 	listenAddr := flag.String("listen", "0.0.0.0:5986", "WinRM HTTPS listen address")
-	pskFlag := flag.String("psk", "", "Pre-Shared Key(s), comma-separated (required)")
+	pskFlag := flag.String("psk", "", "Pre-Shared Key(s), comma-separated")
+	daemonMode := flag.Bool("daemon", false, "Run server using users from users.json")
+	dataDirFlag := flag.String("data-dir", "", "Directory for users.json and control.sock")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
 	keyFile := flag.String("key", "winrm_key.pem", "Path to TLS key")
 	_ = flag.Bool("no-tun", false, "Deprecated (TUN is no longer required)")
 	flag.Parse()
 
-	var pskList []string
+	dataDir := resolveDataDir(*dataDirFlag)
+
+	var cliPSKs []string
 	for _, k := range strings.Split(*pskFlag, ",") {
 		k = strings.TrimSpace(k)
 		if k != "" {
-			pskList = append(pskList, k)
+			cliPSKs = append(cliPSKs, k)
 		}
 	}
-	if len(pskList) == 0 {
-		fmt.Println("Ошибка: не указан обязательный параметр -psk.")
+
+	if !*daemonMode && len(cliPSKs) == 0 {
+		fmt.Println("Ошибка: укажите параметр -psk или -daemon (либо запустите без параметров для CLI-меню).")
 		fmt.Println()
 		printQuickGuide()
 		os.Exit(1)
 	}
 
-	_, fingerprint, hostName, err := loadOrGenerateWindowsCert(*certFile, *keyFile)
+	statsMgr := NewStatsManager(dataDir)
+	if err := statsMgr.LoadOrInit(cliPSKs); err != nil {
+		log.Fatalf("Failed to initialize user store: %v", err)
+	}
+	if len(statsMgr.GetAllPSKs()) == 0 {
+		log.Fatal("ERROR: в базе нет ни одного пользователя (PSK). Добавьте пользователя в CLI-меню или передайте -psk.")
+	}
+	statsMgr.StartPeriodicFlush()
+
+	certPath := resolveAssetPath(*certFile, "winrm_cert.pem", dataDir)
+	keyPath := resolveAssetPath(*keyFile, "winrm_key.pem", dataDir)
+
+	_, fingerprint, hostName, err := loadOrGenerateWindowsCert(certPath, keyPath)
 	if err != nil {
 		log.Fatalf("Certificate error: %v", err)
 	}
@@ -101,11 +121,13 @@ func main() {
 	defer backendLn.Close()
 	backendAddr := backendLn.Addr().String()
 
-	rustlsCmd, tmpPath, err := startEmbeddedRustls(*listenAddr, backendAddr, *certFile, *keyFile)
+	rustlsCmd, tmpPath, err := startEmbeddedRustls(*listenAddr, backendAddr, certPath, keyPath)
 	if err != nil {
 		log.Fatalf("Failed to start embedded rustls frontend: %v", err)
 	}
+
 	cleanup := func() {
+		statsMgr.FlushAndClose()
 		if rustlsCmd != nil && rustlsCmd.Process != nil {
 			_ = rustlsCmd.Process.Signal(syscall.SIGTERM)
 			_ = rustlsCmd.Wait()
@@ -116,17 +138,26 @@ func main() {
 	}
 	defer cleanup()
 
+	shutdownFn := func() {
+		log.Printf("[SYS] Shutting down WinRM-VPN Server v%s...", AppVersion)
+		cleanup()
+		os.Exit(0)
+	}
+
+	if err := statsMgr.StartControlSocket(shutdownFn); err != nil {
+		log.Printf("[WARN] Control socket not started: %v", err)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Printf("[SYS] Shutting down WinRM-VPN Server v%s...", AppVersion)
-		cleanup()
-		os.Exit(0)
+		shutdownFn()
 	}()
 
 	go func() {
 		err := rustlsCmd.Wait()
+		statsMgr.FlushAndClose()
 		_ = os.Remove(tmpPath)
 		log.Fatalf("Embedded rustls frontend exited unexpectedly: %v", err)
 	}()
@@ -134,7 +165,7 @@ func main() {
 	log.Printf("================================================================")
 	log.Printf("WinRM-VPN Server v%s (All-in-One: Rustls + gVisor) Ready on %s", AppVersion, *listenAddr)
 	log.Printf("Emulated Windows Hostname: %s", hostName)
-	log.Printf("Loaded PSK keys: %d", len(pskList))
+	log.Printf("Loaded PSK keys: %d (DataDir: %s)", len(statsMgr.GetAllPSKs()), dataDir)
 	log.Printf("Certificate SHA-256 Pin (copy to Android App):")
 	log.Printf("%s", fingerprint)
 	log.Printf("================================================================")
@@ -144,8 +175,18 @@ func main() {
 		if err != nil {
 			continue
 		}
-		go handleWinRMConnection(conn, pskList, hostName)
+		go handleWinRMConnection(conn, statsMgr, hostName)
 	}
+}
+
+func resolveAssetPath(val, defaultName, dataDir string) string {
+	if val != defaultName || filepath.IsAbs(val) || dataDir == "." {
+		return val
+	}
+	if _, err := os.Stat(val); err == nil {
+		return val
+	}
+	return filepath.Join(dataDir, val)
 }
 
 func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*exec.Cmd, string, error) {
@@ -188,13 +229,13 @@ func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*ex
 	return cmd, tmpPath, nil
 }
 
-func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) bool {
+func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) (string, bool) {
 	for _, psk := range pskList {
 		if common.VerifyNTLMType3Auth(b64Token, psk, challenge) {
-			return true
+			return psk, true
 		}
 	}
-	return false
+	return "", false
 }
 
 func isTimeoutOrClosed(err error) bool {
@@ -205,7 +246,7 @@ func isTimeoutOrClosed(err error) bool {
 	return errors.Is(err, net.ErrClosed)
 }
 
-func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
+func handleWinRMConnection(conn net.Conn, statsMgr *StatsManager, hostName string) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
@@ -272,12 +313,19 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 		}
 
 		if hasChallenge && strings.HasPrefix(b64Token, "TlRMTVNTUAAD") {
-			if verifyAnyPSK(b64Token, pskList, currentChallenge) {
+			if matchedPSK, ok := verifyAnyPSK(b64Token, statsMgr.GetAllPSKs(), currentChallenge); ok {
 				writeWinRM200StreamStart(conn, req.Host)
 				_ = conn.SetDeadline(time.Time{})
 
+				connID := statsMgr.ClientConnected(matchedPSK, conn)
+				defer statsMgr.ClientDisconnected(matchedPSK, connID)
+
 				ns, err := NewClientNetstack(func(pkt []byte) error {
-					return common.WritePaddedFrame(conn, pkt)
+					if err := common.WritePaddedFrame(conn, pkt); err != nil {
+						return err
+					}
+					statsMgr.AddTx(matchedPSK, len(pkt))
+					return nil
 				})
 				if err != nil {
 					log.Printf("Netstack init error: %v", err)
@@ -285,16 +333,17 @@ func handleWinRMConnection(conn net.Conn, pskList []string, hostName string) {
 				}
 				defer ns.Close()
 
-				log.Printf("[+] Client connected")
+				log.Printf("[+] Client connected (key: %.8s...)", matchedPSK)
 				scratch := make([]byte, 65536)
 				for {
 					ipPkt, err := common.ReadPaddedFrame(br, scratch)
 					if err != nil {
 						break
 					}
+					statsMgr.AddRx(matchedPSK, len(ipPkt))
 					ns.InjectPacket(ipPkt)
 				}
-				log.Printf("[-] Client disconnected")
+				log.Printf("[-] Client disconnected (key: %.8s...)", matchedPSK)
 				return
 			}
 		}
