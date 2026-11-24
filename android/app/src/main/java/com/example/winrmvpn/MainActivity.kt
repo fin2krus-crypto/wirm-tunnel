@@ -1,6 +1,7 @@
 package com.example.winrmvpn
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -14,6 +15,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -25,6 +27,7 @@ class MainActivity : Activity() {
     private lateinit var serverInput: EditText
     private lateinit var pskInput: EditText
     private lateinit var pinInput: EditText
+    private lateinit var checkConnSwitch: Switch
 
     private lateinit var errorText: TextView
     private lateinit var statusText: TextView
@@ -34,8 +37,6 @@ class MainActivity : Activity() {
     private lateinit var ipResultText: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
-
-    private var lastAppliedState: String = ""
 
     private val logListener: (String) -> Unit = { line ->
         runOnUiThread {
@@ -66,6 +67,8 @@ __        ___       ____  __  __    __     ______  _   _
         super.onCreate(savedInstanceState)
 
         val prefs = getSharedPreferences("winrm_cfg", Context.MODE_PRIVATE)
+        val savedCheckConn = prefs.getBoolean("check_conn", false)
+        VpnStateBus.checkConnectionEnabled = savedCheckConn
 
         val rootScroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#121212"))
@@ -86,7 +89,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.0.9  |  Should looks like Ansible"
+            text = "v0.1.0  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -113,6 +116,40 @@ __        ___       ____  __  __    __     ______  _   _
             setHintTextColor(Color.parseColor("#78909C"))
         }
 
+        // Переключатель "Проверять соединение" + кнопка (?)
+        val checkRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 14, 0, 6)
+        }
+
+        checkConnSwitch = Switch(this).apply {
+            text = "Проверять соединение"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            isChecked = savedCheckConn
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnCheckedChangeListener { _, isChecked ->
+                prefs.edit().putBoolean("check_conn", isChecked).apply()
+                VpnStateBus.checkConnectionEnabled = isChecked
+                VpnStateBus.log("[UI] Проверка соединения (Watchdog): ${if (isChecked) "ВКЛ" else "ВЫКЛ"}")
+            }
+        }
+
+        val btnCheckInfo = Button(this).apply {
+            text = "(?)"
+            textSize = 13f
+            setTextColor(Color.parseColor("#80D8FF"))
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(16, 4, 8, 4)
+            setOnClickListener {
+                showCheckConnectionInfoDialog()
+            }
+        }
+
+        checkRow.addView(checkConnSwitch)
+        checkRow.addView(btnCheckInfo)
+
         errorText = TextView(this).apply {
             setTextColor(Color.parseColor("#FF5252"))
             textSize = 13f
@@ -134,7 +171,9 @@ __        ___       ____  __  __    __     ______  _   _
                         .putString("server", serverInput.text.toString().trim())
                         .putString("psk", pskInput.text.toString().trim())
                         .putString("pin", pinInput.text.toString().trim())
+                        .putBoolean("check_conn", checkConnSwitch.isChecked)
                         .apply()
+                    VpnStateBus.checkConnectionEnabled = checkConnSwitch.isChecked
                     prepareAndStartVpn()
                 }
             }
@@ -246,6 +285,7 @@ __        ___       ____  __  __    __     ______  _   _
         layout.addView(serverInput)
         layout.addView(pskInput)
         layout.addView(pinInput)
+        layout.addView(checkRow)
         layout.addView(errorText)
         layout.addView(btnRow)
         layout.addView(statusText)
@@ -268,6 +308,20 @@ __        ___       ____  __  __    __     ______  _   _
         VpnStateBus.logListeners.remove(logListener)
         VpnStateBus.stateListeners.remove(stateListener)
         super.onDestroy()
+    }
+
+    private fun showCheckConnectionInfoDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Проверка соединения")
+            .setMessage(
+                "При включённом переключателе и активном VPN-туннеле приложение автоматически отслеживает его работоспособность:\n\n" +
+                "1. Раз в случайный интервал от 30 до 60 секунд отправляется тестовый ping 1.1.1.1.\n\n" +
+                "2. Если ping не прошёл, приложение выдерживает случайную паузу от 10 до 20 секунд и отправляет повторный ping 1.1.1.1.\n\n" +
+                "3. Если повторная проверка снова неудачна, VPN-соединение автоматически перезапускается.\n\n" +
+                "Случайные интервалы используются для предотвращения создания предсказуемой периодической сигнатуры трафика."
+            )
+            .setPositiveButton("Понятно", null)
+            .show()
     }
 
     private fun validateInputs(): Boolean {
@@ -305,9 +359,6 @@ __        ___       ____  __  __    __     ______  _   _
     }
 
     private fun applyStateUi(state: String) {
-        val stateChanged = (state != lastAppliedState)
-        lastAppliedState = state
-
         when (state) {
             "CONNECTING" -> {
                 statusText.text = "Статус: Подключение..."
@@ -325,7 +376,7 @@ __        ___       ____  __  __    __     ______  _   _
                 errorText.visibility = View.GONE
             }
             "ERROR" -> {
-                statusText.text = "Статус: Ошибка (см. логи ниже)"
+                statusText.text = "Статус: Ошибка подключения — VPN выключен (см. логи)"
                 statusText.setTextColor(Color.parseColor("#FF5252"))
                 btnPingTest.isEnabled = false
                 btnCheckIp.isEnabled = false
