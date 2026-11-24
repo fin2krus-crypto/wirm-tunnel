@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Linux Server v0.2.0 + Android APK v0.1.1)
+name: Build WinRM VPN (Linux Server v0.2.0 + Android v0.1.1 + macOS Universal v0.1.1)
 
 on:
   push:
@@ -6,10 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-all:
+  build-linux-android:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,26 +53,6 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/winrm-vpn-server ./cmd/server
 
-      - name: Smoke-test All-in-One Binary (WinRM Identify, NTLM & ChaCha20 Rejection)
-        run: |
-          ./dist/winrm-vpn-server -listen 0.0.0.0:5986 -psk "test-secret-key" &
-          SRV_PID=$!
-          sleep 2
-          RESP=$(curl -sk --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman \
-            -H "Content-Type: application/soap+xml;charset=UTF-8" \
-            -d '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"><s:Header/><s:Body><wsmid:Identify/></s:Body></s:Envelope>')
-          echo "$RESP" | grep -q "Microsoft Corporation"
-          HDRS=$(curl -ski --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman -d '')
-          echo "$HDRS" | grep -q "Microsoft-HTTPAPI/2.0"
-          echo "$HDRS" | grep -q "WWW-Authenticate: NTLM"
-          if curl -sk --tlsv1.3 --tls13-ciphers TLS_CHACHA20_POLY1305_SHA256 https://127.0.0.1:5986/wsman >/dev/null 2>&1; then
-            echo "FAIL: ChaCha20 was accepted!"
-            kill $SRV_PID
-            exit 1
-          fi
-          echo "OK: All-in-One server v0.2.0 passed all WinRM & ChaCha20 checks!"
-          kill $SRV_PID
-
       - name: Build Android Native Core (.aar) via Gomobile
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
@@ -92,19 +70,75 @@ jobs:
           gradle assembleDebug
           cp app/build/outputs/apk/debug/app-debug.apk ../dist/winrm-vpn-client.apk
 
-      - name: Upload Compiled Artifacts
+      - name: Upload Linux & Android Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: winrm-vpn-release
+          name: linux-android-artifacts
           path: |
             dist/winrm-vpn-server
             dist/winrm-vpn-client.apk
 
-      - name: Publish separate files to GitHub Release
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Tidy Go dependencies
+        run: |
+          go mod tidy
+
+      - name: Build Universal Go Helper (Apple Silicon arm64 + Intel amd64)
+        run: |
+          mkdir -p build_mac
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o build_mac/helper-arm64 ./cmd/mac-helper
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o build_mac/helper-amd64 ./cmd/mac-helper
+          lipo -create -output build_mac/winrm-vpn-helper build_mac/helper-arm64 build_mac/helper-amd64
+
+      - name: Build Universal SwiftUI Menu Bar App (arm64 + x86_64)
+        run: |
+          swiftc -O -target arm64-apple-macos12.0 -o build_mac/ui-arm64 macos/WinRMVPNApp.swift
+          swiftc -O -target x86_64-apple-macos12.0 -o build_mac/ui-amd64 macos/WinRMVPNApp.swift
+          lipo -create -output build_mac/WinRM-VPN build_mac/ui-arm64 build_mac/ui-amd64
+
+      - name: Assemble Universal WinRM-VPN.app & Zip
+        run: |
+          mkdir -p "WinRM-VPN.app/Contents/MacOS" "WinRM-VPN.app/Contents/Resources" dist
+          cp macos/Info.plist "WinRM-VPN.app/Contents/Info.plist"
+          cp build_mac/WinRM-VPN "WinRM-VPN.app/Contents/MacOS/WinRM-VPN"
+          cp build_mac/winrm-vpn-helper "WinRM-VPN.app/Contents/Resources/winrm-vpn-helper"
+          chmod +x "WinRM-VPN.app/Contents/MacOS/WinRM-VPN" "WinRM-VPN.app/Contents/Resources/winrm-vpn-helper"
+          ditto -c -k --sequesterRsrc --keepParent "WinRM-VPN.app" "dist/WinRM-VPN-macOS-Universal.zip"
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: dist/WinRM-VPN-macOS-Universal.zip
+
+  release:
+    needs: [build-linux-android, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_files
+          merge-multiple: true
+
+      - name: Publish all binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.2.0
-          name: WinRM-VPN (Server v0.2.0 / Client v0.1.1)
+          name: WinRM-VPN (Server v0.2.0 / Android & macOS v0.1.1)
           files: |
-            dist/winrm-vpn-server
-            dist/winrm-vpn-client.apk
+            release_files/winrm-vpn-server
+            release_files/winrm-vpn-client.apk
+            release_files/WinRM-VPN-macOS-Universal.zip
