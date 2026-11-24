@@ -95,7 +95,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.1.0  |  Should looks like Ansible"
+            text = "v0.1.1  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -276,7 +276,6 @@ __        ___       ____  __  __    __     ______  _   _
             text = VpnStateBus.logs.joinToString("\n")
         }
 
-        // Разрешаем независимую прокрутку лога внутри внешнего ScrollView
         logScroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#0D1117"))
             isVerticalScrollBarEnabled = true
@@ -380,7 +379,7 @@ __        ___       ____  __  __    __     ______  _   _
     private fun applyStateUi(state: String) {
         when (state) {
             "CONNECTING" -> {
-                statusText.text = "Статус: Подключение..."
+                statusText.text = "Статус: Подключение к серверу..."
                 statusText.setTextColor(Color.parseColor("#FFD54F"))
                 pingResultText.text = ""
                 ipResultText.text = ""
@@ -395,7 +394,7 @@ __        ___       ____  __  __    __     ______  _   _
                 errorText.visibility = View.GONE
             }
             "ERROR" -> {
-                statusText.text = "Статус: Ошибка подключения — VPN выключен (см. логи)"
+                statusText.text = "Статус: Не удалось подключиться — VPN выключен (см. логи)"
                 statusText.setTextColor(Color.parseColor("#FF5252"))
                 btnPingTest.isEnabled = false
                 btnCheckIp.isEnabled = false
