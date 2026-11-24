@@ -29,7 +29,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.0.9"
+const AppVersion = "0.1.0"
 
 //go:embed embedded/winrm-tls-rustls
 var embeddedRustlsBin []byte
@@ -45,7 +45,7 @@ func printQuickGuide() {
        openssl rand -hex 24
 
   3. Запустите единый бинарник (root и iptables НЕ требуются):
-       ./winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
+       winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
 
      (Для нескольких пользователей укажите ключи через запятую: -psk "key1,key2")
 
