@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Linux Server v0.3.0 + Android v0.1.1 + macOS Universal v0.1.1)
+name: Build WinRM VPN (Server v0.3.0 + Android + macOS + Linux GUI)
 
 on:
   push:
@@ -99,6 +99,40 @@ jobs:
             dist/winrm-vpn-server
             dist/winrm-vpn-client.apk
 
+  build-linux-gui:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Fyne X11/OpenGL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+
+      - name: Build Static Linux Helper & Embed into GUI Binary
+        run: |
+          go mod tidy
+          mkdir -p linux-gui/embedded dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o linux-gui/embedded/winrm-vpn-linux-helper ./cmd/linux-helper
+
+      - name: Build Linux x86_64 GUI Binary (Fyne)
+        working-directory: linux-gui
+        run: |
+          go mod tidy
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../dist/winrm-vpn-linux-gui .
+
+      - name: Upload Linux GUI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-gui-artifacts
+          path: dist/winrm-vpn-linux-gui
+
   build-macos:
     runs-on: macos-latest
     steps:
@@ -143,7 +177,7 @@ jobs:
           path: dist/WinRM-VPN-macOS-Universal.zip
 
   release:
-    needs: [build-linux-android, build-macos]
+    needs: [build-linux-android, build-linux-gui, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -162,4 +196,5 @@ jobs:
           files: |
             release_files/winrm-vpn-server
             release_files/winrm-vpn-client.apk
+            release_files/winrm-vpn-linux-gui
             release_files/WinRM-VPN-macOS-Universal.zip
