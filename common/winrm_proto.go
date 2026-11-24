@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	mathrand "math/rand"
+	"strings"
 	"time"
 	"unicode/utf16"
 )
@@ -37,9 +39,53 @@ const HttpSysBadRequestHTML = `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN"
 </BODY></HTML>
 `
 
-const FakeSoapCreateShellXML = `<?xml version="1.0" encoding="UTF-8"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"><env:Header><a:To>http://windows-host:5986/wsman</a:To><a:ReplyTo><a:Address mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo><w:MaxEnvelopeSize mustUnderstand="true">153600</w:MaxEnvelopeSize><a:MessageID>uuid:2c7e09a4-5c43-4f82-9a14-83b2a9d1e042</a:MessageID><w:Locale mustUnderstand="false" xml:lang="en-US"/><p:DataLocale mustUnderstand="false" xml:lang="en-US"/><w:OperationTimeout>PT60S</w:OperationTimeout><w:ResourceURI mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><a:Action mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/09/transfer/Create</a:Action></env:Header><env:Body><rsp:Shell><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell></env:Body></env:Envelope>`
+func randomUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
 
-const FakeSoapCreateShellResponseXML = `<s:Envelope xml:lang="en-US" xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:x="http://schemas.xmlsoap.org/ws/2004/09/transfer" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/CreateResponse</a:Action><a:MessageID>uuid:8B2F1D9E-3C10-4E5A-9A01-22E4D1F5A900</a:MessageID><a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To><a:RelatesTo>uuid:2c7e09a4-5c43-4f82-9a14-83b2a9d1e042</a:RelatesTo></s:Header><s:Body><x:ResourceCreated><a:Address>http://windows-host:5986/wsman</a:Address><a:ReferenceParameters><w:ResourceURI>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><w:SelectorSet><w:Selector Name="ShellId">6A9F0C12-5B8E-4D12-8F7A-9C3E1B2D4E5F</w:Selector></w:SelectorSet></a:ReferenceParameters></x:ResourceCreated><rsp:Shell xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><rsp:ShellId>6A9F0C12-5B8E-4D12-8F7A-9C3E1B2D4E5F</rsp:ShellId><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell></s:Body></s:Envelope>`
+// BuildSoapCreateShellXML генерирует уникальный SOAP Create Shell запрос Ansible pywinrm со случайной длиной
+func BuildSoapCreateShellXML(hostAddr string) string {
+	if hostAddr == "" {
+		hostAddr = "windows-host:5986"
+	}
+	msgID := randomUUID()
+	timeouts := []string{"PT60S", "PT120S", "PT180S", "PT300S"}
+	timeout := timeouts[mathrand.Intn(len(timeouts))]
+
+	// Валидные опции WinRM OptionSet + случайный XML-отступ для естественного разброса длины TLS-рекорда
+	extraOpts := ""
+	if mathrand.Intn(2) == 0 {
+		extraOpts = `<w:OptionSet><w:Option Name="WINRS_NOPROFILE">TRUE</w:Option><w:Option Name="WINRS_CODEPAGE">65001</w:Option></w:OptionSet>`
+	} else {
+		extraOpts = `<w:OptionSet><w:Option Name="WINRS_NOPROFILE">FALSE</w:Option></w:OptionSet>`
+	}
+	padSpaces := strings.Repeat(" ", 4+mathrand.Intn(140))
+
+	return fmt.Sprintf(
+		`<?xml version="1.0" encoding="UTF-8"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"><env:Header><a:To>https://%s/wsman</a:To><a:ReplyTo><a:Address mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo><w:MaxEnvelopeSize mustUnderstand="true">153600</w:MaxEnvelopeSize><a:MessageID>uuid:%s</a:MessageID><w:Locale mustUnderstand="false" xml:lang="en-US"/><p:DataLocale mustUnderstand="false" xml:lang="en-US"/><w:OperationTimeout>%s</w:OperationTimeout><w:ResourceURI mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><a:Action mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/09/transfer/Create</a:Action>%s</env:Header><env:Body><rsp:Shell><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell>%s</env:Body></env:Envelope>`,
+		hostAddr, msgID, timeout, extraOpts, padSpaces,
+	)
+}
+
+// BuildSoapCreateShellResponseXML генерирует уникальный SOAP CreateResponse с варьируемой длиной
+func BuildSoapCreateShellResponseXML(hostAddr string) string {
+	if hostAddr == "" {
+		hostAddr = "windows-host:5986"
+	}
+	msgID := strings.ToUpper(randomUUID())
+	relID := randomUUID()
+	shellID := strings.ToUpper(randomUUID())
+	padSpaces := strings.Repeat(" ", 4+mathrand.Intn(160))
+
+	return fmt.Sprintf(
+		`<s:Envelope xml:lang="en-US" xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:x="http://schemas.xmlsoap.org/ws/2004/09/transfer" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/CreateResponse</a:Action><a:MessageID>uuid:%s</a:MessageID><a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To><a:RelatesTo>uuid:%s</a:RelatesTo></s:Header><s:Body><x:ResourceCreated><a:Address>https://%s/wsman</a:Address><a:ReferenceParameters><w:ResourceURI>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><w:SelectorSet><w:Selector Name="ShellId">%s</w:Selector></w:SelectorSet></a:ReferenceParameters></x:ResourceCreated><rsp:Shell xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><rsp:ShellId>%s</rsp:ShellId><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell>%s</s:Body></s:Envelope>`,
+		msgID, relID, hostAddr, shellID, shellID, padSpaces,
+	)
+}
 
 func BuildNTLMType1() string {
 	buf := make([]byte, 40)
@@ -130,7 +176,7 @@ func BuildNTLMType3WithAuth(psk string, serverChallenge [8]byte) string {
 
 	var randLenByte [1]byte
 	_, _ = rand.Read(randLenByte[:])
-	padLen := 48 + int(randLenByte[0]%64)
+	padLen := 48 + int(randLenByte[0]%96)
 	pad := make([]byte, padLen)
 	_, _ = rand.Read(pad)
 
@@ -200,7 +246,6 @@ func VerifyNTLMType3Auth(b64Token string, psk string, serverChallenge [8]byte) b
 	return hmac.Equal(gotSig, expectedSig)
 }
 
-// isInnerTLSHandshake определяет вложенный TLS Handshake (ClientHello/ServerHello/Certificate/CCS) внутри IPv4 TCP-пакета
 func isInnerTLSHandshake(ipPkt []byte) bool {
 	if len(ipPkt) < 43 || (ipPkt[0]>>4) != 4 || ipPkt[9] != 6 {
 		return false
@@ -228,10 +273,6 @@ func fillFastRandom(b []byte) {
 	}
 }
 
-// WritePaddedFrame защищает от детекта TLS-in-TLS и анализа гистограммы длин:
-// 1. Вложенные TLS-хендшейки получают тяжёлый случайный паддинг (150..700 Б) и режутся на 2-3 отдельных внешних TLS-рекорда.
-// 2. Мелкие пакеты выравниваются в случайный диапазон (160..520 Б).
-// 3. Крупные пакеты с вероятностью 50% дробятся на 2 случайных рекорда, ломая сигнатуру цепочек Certificate.
 func WritePaddedFrame(w io.Writer, ipPkt []byte) error {
 	pktLen := len(ipPkt)
 	if pktLen > 65535 {
@@ -259,9 +300,8 @@ func WritePaddedFrame(w io.Writer, ipPkt []byte) error {
 		fillFastRandom(buf[4+pktLen:])
 	}
 
-	// Разбиение на несколько внешних TLS-рекордов для уничтожения сигнатуры TLS-in-TLS
 	if innerTLS && totalLen > 220 {
-		parts := 2 + mathrand.Intn(2) // 2 или 3 отдельных TLS-рекорда
+		parts := 2 + mathrand.Intn(2)
 		offset := 0
 		for p := 0; p < parts; p++ {
 			remaining := totalLen - offset
@@ -284,13 +324,11 @@ func WritePaddedFrame(w io.Writer, ipPkt []byte) error {
 			if offset >= totalLen {
 				break
 			}
-			// Микро-джиттер 1..3 мс между фрагментами вложенного TLS-хендшейка
 			time.Sleep(time.Duration(1+mathrand.Intn(3)) * time.Millisecond)
 		}
 		return nil
 	}
 
-	// Для крупных пакетов (>=450 Б) в 50% случаев режем на 2 случайных рекорда
 	if pktLen >= 450 && mathrand.Intn(2) == 0 {
 		cut := totalLen/4 + mathrand.Intn(totalLen/2)
 		if _, err := w.Write(buf[:cut]); err != nil {
