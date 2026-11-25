@@ -6,6 +6,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
+
 #ifndef WINRM_PORT
 #define WINRM_PORT 5986
 #endif
@@ -37,14 +41,12 @@ int synack_win_order(struct __sk_buff *skb) {
     if ((void *)(tcp + 1) > data_end)
         return TC_ACT_OK;
 
-    // Строго только исходящие SYN,ACK с порта 5986 — остальные сервисы и порты не затрагиваются!
     if (tcp->source != bpf_htons(WINRM_PORT))
         return TC_ACT_OK;
 
     if (!tcp->syn || !tcp->ack || tcp->rst || tcp->fin)
         return TC_ACT_OK;
 
-    // 32 байта (20B заголовок + 12B опций без TCP Timestamps)
     if (tcp->doff != 8)
         return TC_ACT_OK;
 
@@ -53,7 +55,6 @@ int synack_win_order(struct __sk_buff *skb) {
     if (bpf_skb_load_bytes(skb, l4_off + 20, old_opts, 12) < 0)
         return TC_ACT_OK;
 
-    // Проверяем стандартный формат опций Linux (MSS в начале, без Timestamps kind=8)
     if (old_opts[0] != 2 || old_opts[1] != 4)
         return TC_ACT_OK;
 
@@ -70,7 +71,6 @@ int synack_win_order(struct __sk_buff *skb) {
             i += 1;
             continue;
         } else if (kind == 8) {
-            // Timestamps включены — не трогаем пакет
             return TC_ACT_OK;
         } else if (kind == 2 && i + 4 <= 12 && old_opts[i + 1] == 4) {
             i += 4;
@@ -92,27 +92,25 @@ int synack_win_order(struct __sk_buff *skb) {
     if (!has_ws || !has_sack)
         return TC_ACT_OK;
 
-    // Перестраиваем в канонический порядок Windows Server 2022:
-    // MSS (4B) + NOP (1B) + WScale (3B) + NOP (1B) + NOP (1B) + SACK_PERM (2B) = 12B
     __u8 new_opts[12];
     new_opts[0] = 2;
     new_opts[1] = 4;
     new_opts[2] = old_opts[2];
     new_opts[3] = old_opts[3];
-    new_opts[4] = 1;      // NOP
-    new_opts[5] = 3;      // WScale
+    new_opts[4] = 1;
+    new_opts[5] = 3;
     new_opts[6] = 3;
-    new_opts[7] = ws_val; // Сохраняем реальный shift ядра (с tcp_rmem=12MB это 8)
-    new_opts[8] = 1;      // NOP
-    new_opts[9] = 1;      // NOP
-    new_opts[10] = 4;     // SACK_PERM
+    new_opts[7] = ws_val;
+    new_opts[8] = 1;
+    new_opts[9] = 1;
+    new_opts[10] = 4;
     new_opts[11] = 2;
 
     __s64 diff = bpf_csum_diff((__be32 *)old_opts, 12, (__be32 *)new_opts, 12, 0);
     if (bpf_skb_store_bytes(skb, l4_off + 20, new_opts, 12, 0) < 0)
         return TC_ACT_OK;
 
-    bpf_l4_csum_replace(skb, l4_off + offsetof(struct tcphdr, check), 0, diff, 0);
+    bpf_l4_csum_replace(skb, l4_off + __builtin_offsetof(struct tcphdr, check), 0, diff, 0);
     return TC_ACT_OK;
 }
 
