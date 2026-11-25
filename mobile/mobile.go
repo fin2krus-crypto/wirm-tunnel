@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,14 +35,21 @@ type TunnelCallback interface {
 }
 
 var (
-	mu            sync.Mutex
-	running       bool
-	stopChan      chan struct{}
-	reconnectChan chan struct{}
-	activeConn    net.Conn
+	mu               sync.Mutex
+	running          bool
+	stopChan         chan struct{}
+	reconnectChan    chan struct{}
+	activeRecvRaw    net.Conn
+	activeSendRaw    net.Conn
+	checkConnEnabled atomic.Bool
+	lastRxNano       atomic.Int64
 )
 
 const maxConnectAttempts = 3
+
+func SetCheckConnection(enabled bool) {
+	checkConnEnabled.Store(enabled)
+}
 
 func emitLog(cb TunnelCallback, format string, args ...any) {
 	if cb != nil {
@@ -56,11 +65,17 @@ func emitState(cb TunnelCallback, state string) {
 
 func TriggerReconnect() {
 	mu.Lock()
-	if activeConn != nil {
-		_ = activeConn.Close()
-	}
+	rRaw := activeRecvRaw
+	sRaw := activeSendRaw
 	ch := reconnectChan
 	mu.Unlock()
+
+	if rRaw != nil {
+		_ = rRaw.Close()
+	}
+	if sRaw != nil {
+		_ = sRaw.Close()
+	}
 
 	if ch != nil {
 		select {
@@ -85,9 +100,12 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 
 	expectedPin := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(expectedCertSha256), ":", ""))
 
+	var sessionID [16]byte
+	_, _ = rand.Read(sessionID[:])
+
 	go func() {
 		var tunFile *os.File
-		tunRxCh := make(chan []byte, 128)
+		tunRxCh := make(chan []byte, 256)
 
 		defer func() {
 			if tunFile != nil {
@@ -95,7 +113,6 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 			}
 		}()
 
-		// Поднимает TUN-интерфейс на стороне Android только после успешного подключения к серверу
 		ensureTun := func() (*os.File, error) {
 			if tunFile != nil {
 				return tunFile, nil
@@ -114,7 +131,6 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 			_ = syscall.SetNonblock(dupFd, true)
 			tunFile = os.NewFile(uintptr(dupFd), "tun")
 
-			// Единственная горутина чтения TUN на всё время жизни сервиса
 			go func(tf *os.File) {
 				buf := make([]byte, 2048)
 				for {
@@ -157,12 +173,11 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 			emitLog(cb, "[SYS] Попытка подключения %d/%d...", attempt, maxConnectAttempts)
 			emitState(cb, "CONNECTING")
 
-			wasConnected, err := runSingleSession(serverAddr, psk, expectedPin, protector, cb, ensureTun, tunRxCh, localStop)
+			wasConnected, rotated, err := runDualChannelSession(serverAddr, psk, expectedPin, sessionID, protector, cb, ensureTun, tunRxCh, localStop)
 			if err != nil {
 				emitLog(cb, "[ERR] Session ended: %v", err)
 			}
 			if wasConnected {
-				// Если сессия была активна и оборвалась позже — сбрасываем счётчик попыток
 				attempt = 0
 			}
 
@@ -171,6 +186,11 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 				emitState(cb, "DISCONNECTED")
 				return
 			default:
+			}
+
+			if rotated {
+				emitLog(cb, "[SYS] Плановая ротация сокетов WinRM...")
+				continue
 			}
 
 			if attempt >= maxConnectAttempts {
@@ -186,7 +206,6 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 				return
 			}
 
-			// Случайная задержка от 2.0 до 6.0 секунд перед следующей попыткой
 			delayMs := 2000 + mathrand.Intn(4001)
 			emitLog(cb, "[SYS] Повторная попытка через %.1f сек...", float64(delayMs)/1000.0)
 
@@ -196,7 +215,8 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 				return
 			case <-localReconn:
 				attempt = 0
-				emitLog(cb, "[SYS] Переключение сети — немедленный сброс счётчика и переподключение...")
+				_, _ = rand.Read(sessionID[:])
+				emitLog(cb, "[SYS] Переключение сети — переподключение...")
 			case <-time.After(time.Duration(delayMs) * time.Millisecond):
 			}
 		}
@@ -207,28 +227,44 @@ func StartWinRMTunnel(serverAddr string, psk string, expectedCertSha256 string, 
 
 func StopWinRMTunnel() {
 	mu.Lock()
-	defer mu.Unlock()
 	if !running {
+		mu.Unlock()
 		return
 	}
 	running = false
 	close(stopChan)
-	if activeConn != nil {
-		_ = activeConn.Close()
-	}
+	rRaw := activeRecvRaw
+	sRaw := activeSendRaw
 	reconnectChan = nil
+	mu.Unlock()
+
+	if rRaw != nil {
+		_ = rRaw.Close()
+	}
+	if sRaw != nil {
+		_ = sRaw.Close()
+	}
 }
 
-func runSingleSession(
+func gracefulTLSClose(uConn *utls.UConn, rawConn net.Conn) {
+	if rawConn != nil {
+		_ = rawConn.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+	}
+	if uConn != nil {
+		_ = uConn.Close()
+	} else if rawConn != nil {
+		_ = rawConn.Close()
+	}
+}
+
+func dialWinRMChannel(
 	serverAddr, psk, expectedPin string,
+	sessionID [16]byte,
+	role byte,
 	protector SocketProtector,
 	cb TunnelCallback,
-	ensureTun func() (*os.File, error),
-	tunRxCh <-chan []byte,
-	localStop <-chan struct{},
-) (bool, error) {
-	emitLog(cb, "[TCP] Dialing %s (IPv4)...", serverAddr)
-
+	verbose bool,
+) (net.Conn, *utls.UConn, *bufio.Reader, error) {
 	dialer := &net.Dialer{
 		Timeout: 4 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -244,123 +280,80 @@ func runSingleSession(
 
 	rawConn, err := dialer.Dial("tcp4", serverAddr)
 	if err != nil {
-		return false, fmt.Errorf("TCP connect failed: %w", err)
+		return nil, nil, nil, fmt.Errorf("TCP connect failed: %w", err)
 	}
-
-	mu.Lock()
-	activeConn = rawConn
-	mu.Unlock()
-
-	defer func() {
-		mu.Lock()
-		if activeConn == rawConn {
-			activeConn = nil
-		}
-		mu.Unlock()
-		_ = rawConn.Close()
-	}()
-
-	// Ограничение 5 сек на TLS + 3-шаговый NTLM хендшейк
 	_ = rawConn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	emitLog(cb, "[TCP] Connected to %s", rawConn.RemoteAddr().String())
-	emitLog(cb, "[TLS] Starting Handshake (Profile: Ansible / Linux OpenSSL 3.x, no SNI)...")
-
-	uCfg := &utls.Config{
-		InsecureSkipVerify: true,
-	}
-	uConn := utls.UClient(rawConn, uCfg, utls.HelloCustom)
-
+	uConn := utls.UClient(rawConn, &utls.Config{InsecureSkipVerify: true}, utls.HelloCustom)
 	if err := uConn.ApplyPreset(buildAnsibleLinuxOpenSSL3Spec()); err != nil {
-		return false, fmt.Errorf("uTLS preset error: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	if err := uConn.Handshake(); err != nil {
-		return false, fmt.Errorf("TLS handshake failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
 	state := uConn.ConnectionState()
-	emitLog(cb, "[TLS] Handshake OK (Version: 0x%x, Cipher: %s)", state.Version, tls.CipherSuiteName(state.CipherSuite))
-
 	if len(state.PeerCertificates) == 0 {
-		return false, errors.New("server provided no certificate")
+		_ = rawConn.Close()
+		return nil, nil, nil, errors.New("no server certificate")
 	}
 	h := sha256.Sum256(state.PeerCertificates[0].Raw)
 	gotPin := hex.EncodeToString(h[:])
-	emitLog(cb, "[TLS] Server Cert CN=%s, SHA-256=%s...", state.PeerCertificates[0].Subject.CommonName, gotPin[:16])
-
-	if expectedPin != "" {
-		if gotPin != expectedPin {
-			return false, fmt.Errorf("Certificate Pin mismatch! Expected %s..., got %s...", expectedPin[:12], gotPin[:12])
-		}
-		emitLog(cb, "[TLS] Certificate Pin verified OK")
-	} else {
-		emitLog(cb, "[TLS] Pinning skipped (empty pin field)")
+	if verbose {
+		emitLog(cb, "[TLS] OK (%s), Cert CN=%s, Pin=%s...",
+			tls.CipherSuiteName(state.CipherSuite), state.PeerCertificates[0].Subject.CommonName, gotPin[:12])
+	}
+	if expectedPin != "" && gotPin != expectedPin {
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("Certificate Pin mismatch! Got %s...", gotPin[:12])
 	}
 
 	br := bufio.NewReader(uConn)
-
 	soapBody := common.BuildSoapCreateShellXML(serverAddr)
 
-	// Шаг 1/3: POST /wsman без заголовка Authorization
-	emitLog(cb, "[HTTP 1/3] -> POST %s (no auth, SOAP %dB)", common.WinRMPath, len(soapBody))
-	req0 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"User-Agent: %s\r\n"+
-		"Accept-Encoding: gzip, deflate\r\n"+
-		"Accept: */*\r\n"+
-		"Connection: keep-alive\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Content-Length: %d\r\n\r\n%s",
+	// Шаг 1/3: POST /wsman без Authorization
+	req0 := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n%s",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, len(soapBody), soapBody)
-
 	if _, err := io.WriteString(uConn, req0); err != nil {
-		return false, fmt.Errorf("HTTP step 1/3 write failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
-
 	resp0, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return false, fmt.Errorf("HTTP step 1/3 read failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	_, _ = io.Copy(io.Discard, resp0.Body)
 	_ = resp0.Body.Close()
-
-	emitLog(cb, "[HTTP 1/3] <- %s (Server: %s)", resp0.Status, resp0.Header.Get("Server"))
 	if resp0.StatusCode != 401 {
-		return false, fmt.Errorf("expected 401 on step 1/3, got %d", resp0.StatusCode)
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("expected 401 on 1/3, got %d", resp0.StatusCode)
 	}
 
-	// Шаг 2/3: POST /wsman с Authorization: NTLM <Type 1>
-	emitLog(cb, "[HTTP 2/3] -> POST %s (Authorization: NTLM Type 1)", common.WinRMPath)
+	// Шаг 2/3: NTLM Type 1
 	t1 := common.BuildNTLMType1()
-	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"User-Agent: %s\r\n"+
-		"Accept-Encoding: gzip, deflate\r\n"+
-		"Accept: */*\r\n"+
-		"Connection: keep-alive\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Authorization: NTLM %s\r\n"+
-		"Content-Length: 0\r\n\r\n",
+	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nAuthorization: NTLM %s\r\nContent-Length: 0\r\n\r\n",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t1)
-
 	if _, err := io.WriteString(uConn, req1); err != nil {
-		return false, fmt.Errorf("HTTP step 2/3 write failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
-
 	resp1, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return false, fmt.Errorf("HTTP step 2/3 read failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	_, _ = io.Copy(io.Discard, resp1.Body)
 	_ = resp1.Body.Close()
-
-	emitLog(cb, "[HTTP 2/3] <- %s", resp1.Status)
 	if resp1.StatusCode != 401 {
-		return false, fmt.Errorf("expected 401 Unauthorized on step 2/3, got %d", resp1.StatusCode)
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("expected 401 on 2/3, got %d", resp1.StatusCode)
 	}
 
 	var serverChallenge [8]byte
-	foundChallenge := false
+	found := false
 	for _, hdr := range resp1.Header.Values("WWW-Authenticate") {
 		var b64 string
 		if strings.HasPrefix(hdr, "NTLM ") {
@@ -369,76 +362,236 @@ func runSingleSession(
 			b64 = strings.TrimSpace(strings.TrimPrefix(hdr, "Negotiate "))
 		}
 		if b64 != "" {
-			raw, err := base64.StdEncoding.DecodeString(b64)
-			if err == nil && len(raw) >= 32 {
+			if raw, err := base64.StdEncoding.DecodeString(b64); err == nil && len(raw) >= 32 {
 				copy(serverChallenge[:], raw[24:32])
-				foundChallenge = true
+				found = true
 			}
 		}
 	}
-	if !foundChallenge {
-		return false, errors.New("server did not return NTLM Type 2 Challenge")
+	if !found {
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, errors.New("no NTLM Type 2 Challenge")
 	}
-	emitLog(cb, "[NTLM] Received Type 2 Challenge: %s", hex.EncodeToString(serverChallenge[:]))
 
-	// Шаг 3/3: POST /wsman с Authorization: NTLM <Type 3 + HMAC> и телом SOAP Create Shell
-	emitLog(cb, "[HTTP 3/3] -> POST %s (Authorization: NTLM Type 3 + SOAP)", common.WinRMPath)
-	t3 := common.BuildNTLMType3WithAuth(psk, serverChallenge)
-	req2 := fmt.Sprintf("POST %s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"User-Agent: %s\r\n"+
-		"Accept-Encoding: gzip, deflate\r\n"+
-		"Accept: */*\r\n"+
-		"Connection: keep-alive\r\n"+
-		"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
-		"Authorization: NTLM %s\r\n"+
-		"Content-Length: %d\r\n\r\n%s",
+	// Шаг 3/3: NTLM Type 3 + SOAP
+	t3 := common.BuildNTLMType3SessionAuth(psk, serverChallenge, sessionID, role)
+	req2 := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nAuthorization: NTLM %s\r\nContent-Length: %d\r\n\r\n%s",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t3, len(soapBody), soapBody)
-
 	if _, err := io.WriteString(uConn, req2); err != nil {
-		return false, fmt.Errorf("HTTP step 3/3 write failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
-
 	resp2, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return false, fmt.Errorf("HTTP step 3/3 read failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
-	emitLog(cb, "[HTTP 3/3] <- %s (SOAP %dB)", resp2.Status, resp2.ContentLength)
 	if resp2.StatusCode != 200 {
-		return false, fmt.Errorf("auth rejected (%d) — проверьте PSK или системное время!", resp2.StatusCode)
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("auth rejected (%d) — проверьте PSK или часы", resp2.StatusCode)
 	}
 	if resp2.ContentLength > 0 {
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
 	}
+	_ = resp2.Body.Close()
 
 	_ = rawConn.SetDeadline(time.Time{})
+	return rawConn, uConn, br, nil
+}
 
-	// Соединение с сервером успешно установлено — только теперь поднимаем Android TUN!
-	tf, err := ensureTun()
+func runDualChannelSession(
+	serverAddr, psk, expectedPin string,
+	sessionID [16]byte,
+	protector SocketProtector,
+	cb TunnelCallback,
+	ensureTun func() (*os.File, error),
+	tunRxCh <-chan []byte,
+	localStop <-chan struct{},
+) (wasConnected bool, rotated bool, err error) {
+	emitLog(cb, "[HTTP] Открытие канала Receive...")
+	recvRaw, recvU, recvBR, err := dialWinRMChannel(serverAddr, psk, expectedPin, sessionID, common.RoleRecv, protector, cb, true)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
-	emitLog(cb, "[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
+	emitLog(cb, "[HTTP] Открытие канала Send...")
+	sendRaw, sendU, sendBR, err := dialWinRMChannel(serverAddr, psk, expectedPin, sessionID, common.RoleSend, protector, cb, false)
+	if err != nil {
+		gracefulTLSClose(recvU, recvRaw)
+		return false, false, err
+	}
+
+	mu.Lock()
+	activeRecvRaw = recvRaw
+	activeSendRaw = sendRaw
+	mu.Unlock()
+
+	tf, err := ensureTun()
+	if err != nil {
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+		mu.Lock()
+		activeRecvRaw, activeSendRaw = nil, nil
+		mu.Unlock()
+		return false, false, err
+	}
+
+	lastRxNano.Store(time.Now().UnixNano())
+	emitLog(cb, "[VPN] 2-канальный WinRM туннель активен (Receive chunked + Send POST).")
 	emitState(cb, "CONNECTED")
 
 	sessionDone := make(chan struct{})
-	defer close(sessionDone)
+	errCh := make(chan error, 3)
+	rotateCh := make(chan struct{}, 1)
+	kaReqCh := make(chan struct{}, 4)
+	kaAckCh := make(chan struct{}, 4)
 
-	errCh := make(chan error, 2)
+	// Плановая ротация TCP+TLS сокетов раз в 10–15 минут (с чистым TLS close_notify)
+	rotateTimer := time.NewTimer(time.Duration(10+mathrand.Intn(6)) * time.Minute)
+	defer rotateTimer.Stop()
 
-	// TUN -> Сервер
+	// Канал 1: Receive (POST /wsman Receive -> 200 OK chunked)
 	go func() {
+		for {
+			select {
+			case <-sessionDone:
+				return
+			default:
+			}
+
+			recvSoap := common.BuildSoapReceiveXML(serverAddr)
+			reqStr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n%s",
+				common.WinRMPath, serverAddr, common.WinRMUserAgent, len(recvSoap), recvSoap)
+
+			_ = recvRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(recvU, reqStr); err != nil {
+				select {
+				case errCh <- fmt.Errorf("recv write: %w", err):
+				default:
+				}
+				return
+			}
+			_ = recvRaw.SetWriteDeadline(time.Time{})
+
+			resp, err := http.ReadResponse(recvBR, nil)
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("recv header: %w", err):
+				default:
+				}
+				return
+			}
+			if resp.StatusCode != 200 {
+				_ = resp.Body.Close()
+				select {
+				case errCh <- fmt.Errorf("recv status %d", resp.StatusCode):
+				default:
+				}
+				return
+			}
+
+			for {
+				fType, pkts, err := common.DecodeBatchFrame(resp.Body)
+				if err != nil {
+					_ = resp.Body.Close()
+					if errors.Is(err, io.EOF) {
+						// Завершился 55-85с чанк ReceiveResponse -> открываем следующий Receive
+						break
+					}
+					select {
+					case errCh <- fmt.Errorf("recv chunk: %w", err):
+					default:
+					}
+					return
+				}
+				lastRxNano.Store(time.Now().UnixNano())
+				if fType == common.FrameKeepAlive {
+					select {
+					case kaAckCh <- struct{}{}:
+					default:
+					}
+				} else {
+					for _, pkt := range pkts {
+						if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
+							_, _ = tf.Write(pkt)
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	// Канал 2: Send (3ms коалесирующий батчер -> POST /wsman -> 200 OK SendResponse)
+	go func() {
+		sendBatchHTTP := func(frame []byte) error {
+			hdr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n",
+				common.WinRMPath, serverAddr, common.WinRMUserAgent, len(frame))
+			full := make([]byte, len(hdr)+len(frame))
+			copy(full, hdr)
+			copy(full[len(hdr):], frame)
+
+			_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := sendU.Write(full); err != nil {
+				return err
+			}
+			_ = sendRaw.SetWriteDeadline(time.Time{})
+
+			_ = sendRaw.SetReadDeadline(time.Now().Add(10 * time.Second))
+			resp, err := http.ReadResponse(sendBR, nil)
+			if err != nil {
+				return err
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			_ = sendRaw.SetReadDeadline(time.Time{})
+			if resp.StatusCode != 200 {
+				return fmt.Errorf("send status %d", resp.StatusCode)
+			}
+			return nil
+		}
+
 		for {
 			select {
 			case <-sessionDone:
 				return
 			case <-localStop:
 				return
-			case pkt := <-tunRxCh:
-				if err := common.WritePaddedFrame(uConn, pkt); err != nil {
+			case <-kaReqCh:
+				frame := common.EncodeBatchFrame(nil, common.FrameKeepAlive)
+				if err := sendBatchHTTP(frame); err != nil {
 					select {
-					case errCh <- fmt.Errorf("tunnel write error: %w", err):
+					case errCh <- fmt.Errorf("send keepalive: %w", err):
+					default:
+					}
+					return
+				}
+			case firstPkt := <-tunRxCh:
+				pkts := make([][]byte, 1, 24)
+				pkts[0] = firstPkt
+				batchBytes := len(firstPkt)
+
+				cTimer := time.NewTimer(3 * time.Millisecond)
+			drain:
+				for len(pkts) < 24 && batchBytes < 32768 {
+					select {
+					case p := <-tunRxCh:
+						pkts = append(pkts, p)
+						batchBytes += len(p)
+					case <-cTimer.C:
+						break drain
+					}
+				}
+				if !cTimer.Stop() {
+					select {
+					case <-cTimer.C:
+					default:
+					}
+				}
+
+				frame := common.EncodeBatchFrame(pkts, common.FrameData)
+				if err := sendBatchHTTP(frame); err != nil {
+					select {
+					case errCh <- fmt.Errorf("send batch: %w", err):
 					default:
 					}
 					return
@@ -447,37 +600,121 @@ func runSingleSession(
 		}
 	}()
 
-	// Сервер -> TUN
+	// Пассивный + WinRM-размерный Watchdog (без палевного ICMP ping)
 	go func() {
-		scratch := make([]byte, 65536)
 		for {
-			pkt, err := common.ReadPaddedFrame(br, scratch)
-			if err != nil {
-				select {
-				case errCh <- fmt.Errorf("tunnel read error: %w", err):
-				default:
-				}
+			waitSec := 30 + mathrand.Intn(31)
+			select {
+			case <-sessionDone:
+				return
+			case <-localStop:
+				return
+			case <-time.After(time.Duration(waitSec) * time.Second):
+			}
+
+			if !checkConnEnabled.Load() {
+				continue
+			}
+
+			lastRx := time.Unix(0, lastRxNano.Load())
+			if time.Since(lastRx) < 30*time.Second {
+				// Трафик активно идёт — ничего не шлём
+				continue
+			}
+
+			// Дренируем старые ACK
+			for len(kaAckCh) > 0 {
+				<-kaAckCh
+			}
+			select {
+			case kaReqCh <- struct{}{}:
+			default:
+			}
+
+			gotReply := false
+			select {
+			case <-kaAckCh:
+				gotReply = true
+			case <-time.After(5 * time.Second):
+			case <-sessionDone:
 				return
 			}
-			if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
-				if _, err := tf.Write(pkt); err != nil {
-					select {
-					case errCh <- fmt.Errorf("TUN write error: %w", err):
-					default:
-					}
-					return
-				}
+			if gotReply || time.Since(time.Unix(0, lastRxNano.Load())) < 10*time.Second {
+				emitLog(cb, "[WATCHDOG] WinRM KeepAlive OK")
+				continue
 			}
+
+			retrySec := 10 + mathrand.Intn(11)
+			emitLog(cb, "[WATCHDOG] Нет ответа на KeepAlive. Повтор через %dс...", retrySec)
+			select {
+			case <-sessionDone:
+				return
+			case <-localStop:
+				return
+			case <-time.After(time.Duration(retrySec) * time.Second):
+			}
+
+			if !checkConnEnabled.Load() {
+				continue
+			}
+			select {
+			case kaReqCh <- struct{}{}:
+			default:
+			}
+
+			gotReply = false
+			select {
+			case <-kaAckCh:
+				gotReply = true
+			case <-time.After(5 * time.Second):
+			case <-sessionDone:
+				return
+			}
+			if gotReply || time.Since(time.Unix(0, lastRxNano.Load())) < 10*time.Second {
+				emitLog(cb, "[WATCHDOG] Повторный KeepAlive OK")
+				continue
+			}
+
+			emitLog(cb, "[WATCHDOG] Повторный KeepAlive не прошёл! Перезапуск...")
+			select {
+			case errCh <- errors.New("watchdog timeout"):
+			default:
+			}
+			return
 		}
 	}()
+
+	var retErr error
+	var isRotate bool
 
 	select {
 	case <-localStop:
-		emitLog(cb, "[VPN] Stopped by user.")
-		return true, nil
-	case err := <-errCh:
-		return true, err
+		emitLog(cb, "[VPN] Штатное отключение (TLS close_notify)...")
+		close(sessionDone)
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+	case <-rotateTimer.C:
+		isRotate = true
+		close(sessionDone)
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+	case <-rotateCh:
+		isRotate = true
+		close(sessionDone)
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+	case retErr = <-errCh:
+		close(sessionDone)
+		_ = recvRaw.Close()
+		_ = sendRaw.Close()
 	}
+
+	mu.Lock()
+	activeRecvRaw = nil
+	activeSendRaw = nil
+	mu.Unlock()
+
+	return true, isRotate, retErr
 }
 
 func buildAnsibleLinuxOpenSSL3Spec() *utls.ClientHelloSpec {
@@ -485,62 +722,29 @@ func buildAnsibleLinuxOpenSSL3Spec() *utls.ClientHelloSpec {
 		TLSVersMin: utls.VersionTLS12,
 		TLSVersMax: utls.VersionTLS13,
 		CipherSuites: []uint16{
-			0x1302, // TLS_AES_256_GCM_SHA384
-			0x1303, // TLS_CHACHA20_POLY1305_SHA256
-			0x1301, // TLS_AES_128_GCM_SHA256
-			0xc02c, // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-			0xc030, // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-			0xcca9, // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-			0xcca8, // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-			0xc02b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-			0xc02f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-			0xc024, // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
-			0xc028, // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384
-			0xc023, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256
-			0xc027, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
-			0xc00a, // TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
-			0xc014, // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
-			0xc009, // TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
-			0xc013, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
-			0x009d, // TLS_RSA_WITH_AES_256_GCM_SHA384
-			0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256
-			0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
-			0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
-			0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
-			0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
-			0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+			0x1302, 0x1303, 0x1301,
+			0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc02b, 0xc02f,
+			0xc024, 0xc028, 0xc023, 0xc027,
+			0xc00a, 0xc014, 0xc009, 0xc013,
+			0x009d, 0x009c, 0x003d, 0x003c, 0x0035, 0x002f, 0x00ff,
 		},
 		CompressionMethods: []uint8{0x00},
 		Extensions: []utls.TLSExtension{
 			&utls.SupportedPointsExtension{SupportedPoints: []byte{0x00, 0x01, 0x02}},
 			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
-				utls.X25519,
-				utls.CurveP256,
-				utls.CurveP521,
-				utls.CurveP384,
+				utls.X25519, utls.CurveP256, utls.CurveP521, utls.CurveP384,
 			}},
 			&utls.SessionTicketExtension{},
-			&utls.GenericExtension{Id: 22}, // encrypt_then_mac (RFC 7366)
+			&utls.GenericExtension{Id: 22},
 			&utls.UtlsExtendedMasterSecretExtension{},
 			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
-				utls.ECDSAWithP256AndSHA256,
-				utls.ECDSAWithP384AndSHA384,
-				utls.ECDSAWithP521AndSHA512,
-				utls.PSSWithSHA256,
-				utls.PSSWithSHA384,
-				utls.PSSWithSHA512,
-				utls.PKCS1WithSHA256,
-				utls.PKCS1WithSHA384,
-				utls.PKCS1WithSHA512,
+				utls.ECDSAWithP256AndSHA256, utls.ECDSAWithP384AndSHA384, utls.ECDSAWithP521AndSHA512,
+				utls.PSSWithSHA256, utls.PSSWithSHA384, utls.PSSWithSHA512,
+				utls.PKCS1WithSHA256, utls.PKCS1WithSHA384, utls.PKCS1WithSHA512,
 			}},
-			&utls.SupportedVersionsExtension{Versions: []uint16{
-				utls.VersionTLS13,
-				utls.VersionTLS12,
-			}},
+			&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}},
 			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
-			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
-				{Group: utls.X25519},
-			}},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519}}},
 		},
 	}
 }

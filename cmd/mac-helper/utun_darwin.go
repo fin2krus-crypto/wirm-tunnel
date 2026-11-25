@@ -16,7 +16,7 @@ import (
 
 const (
 	utunControlName = "com.apple.net.utun_control"
-	ctliocginfo     = 0xc0644e03 // _IOWR('N', 3, struct ctl_info)
+	ctliocginfo     = 0xc0644e03
 	sysprotoControl = 2
 	utunOptIfname   = 2
 )
@@ -65,7 +65,7 @@ func writeMacUtunIPv4(f *os.File, pkt []byte) error {
 	buf[0] = 0
 	buf[1] = 0
 	buf[2] = 0
-	buf[3] = 2 // AF_INET
+	buf[3] = 2
 	copy(buf[4:], pkt)
 	_, err := f.Write(buf)
 	return err
@@ -170,13 +170,11 @@ func (m *MacNetworkState) Setup(ifname, serverIP string) error {
 	m.serviceName = findMacNetworkService(phys)
 	m.origDNS = getMacDNSServers(m.serviceName)
 
-	// 1. Поднимаем интерфейс utun
 	if out, err := exec.Command("ifconfig", ifname, "inet", "10.88.0.2", "10.88.0.1", "mtu", "1380", "up").CombinedOutput(); err != nil {
 		return fmt.Errorf("ifconfig inet failed: %v (%s)", err, string(out))
 	}
 	_ = exec.Command("ifconfig", ifname, "inet6", "fd00:88::2", "prefixlen", "128").Run()
 
-	// 2. Маршрут-исключение до самого VPN-сервера через физический шлюз
 	_ = exec.Command("route", "-n", "delete", "-host", serverIP).Run()
 	if gw != "" {
 		if out, err := exec.Command("route", "-n", "add", "-host", serverIP, gw).CombinedOutput(); err != nil {
@@ -186,13 +184,11 @@ func (m *MacNetworkState) Setup(ifname, serverIP string) error {
 		_ = exec.Command("route", "-n", "add", "-host", serverIP, "-interface", phys).Run()
 	}
 
-	// 3. Маршрутизация всего IPv4 через utun + блокировка утечек IPv6
 	_ = exec.Command("route", "-n", "add", "-net", "0.0.0.0/1", "-interface", ifname).Run()
 	_ = exec.Command("route", "-n", "add", "-net", "128.0.0.0/1", "-interface", ifname).Run()
 	_ = exec.Command("route", "-n", "add", "-inet6", "::/1", "-interface", ifname).Run()
 	_ = exec.Command("route", "-n", "add", "-inet6", "8000::/1", "-interface", ifname).Run()
 
-	// 4. DNS 1.1.1.1 (внутри туннеля)
 	if m.serviceName != "" {
 		setMacDNSServers(m.serviceName, []string{"1.1.1.1"})
 	}
@@ -201,8 +197,7 @@ func (m *MacNetworkState) Setup(ifname, serverIP string) error {
 	return nil
 }
 
-// UpdateOnNetworkChange обновляет /32-маршрут и DNS при смене Wi-Fi / модема
-func (m *MacNetworkState) UpdateOnNetworkChange() (changed bool, desc string) {
+func (m *MacNetworkState) UpdateOnNetworkChange() (bool, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.configured {
@@ -217,7 +212,6 @@ func (m *MacNetworkState) UpdateOnNetworkChange() (changed bool, desc string) {
 		return false, ""
 	}
 
-	// Восстанавливаем DNS на старом интерфейсе
 	if m.serviceName != "" {
 		setMacDNSServers(m.serviceName, m.origDNS)
 	}

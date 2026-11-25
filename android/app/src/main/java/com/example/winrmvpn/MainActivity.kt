@@ -19,6 +19,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import mobile.Mobile
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -40,16 +41,14 @@ class MainActivity : Activity() {
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
 
+    @Volatile private var autoScrollEnabled: Boolean = true
+
     private val logListener: (String) -> Unit = { line ->
         runOnUiThread {
-            val wasAtBottom = !logScroll.canScrollVertically(1)
             if (logText.text.isNotEmpty()) {
                 logText.append("\n$line")
             } else {
                 logText.text = line
-            }
-            if (wasAtBottom) {
-                logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
             }
         }
     }
@@ -75,6 +74,7 @@ __        ___       ____  __  __    __     ______  _   _
         val prefs = getSharedPreferences("winrm_cfg", Context.MODE_PRIVATE)
         val savedCheckConn = prefs.getBoolean("check_conn", false)
         VpnStateBus.checkConnectionEnabled = savedCheckConn
+        Mobile.setCheckConnection(savedCheckConn)
 
         val rootScroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#121212"))
@@ -95,7 +95,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.1.1  |  Should looks like Ansible"
+            text = "v0.2.0  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -137,6 +137,7 @@ __        ___       ____  __  __    __     ______  _   _
             setOnCheckedChangeListener { _, isChecked ->
                 prefs.edit().putBoolean("check_conn", isChecked).apply()
                 VpnStateBus.checkConnectionEnabled = isChecked
+                Mobile.setCheckConnection(isChecked)
                 VpnStateBus.log("[UI] Проверка соединения (Watchdog): ${if (isChecked) "ВКЛ" else "ВЫКЛ"}")
             }
         }
@@ -172,6 +173,7 @@ __        ___       ____  __  __    __     ______  _   _
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener {
                 if (validateInputs()) {
+                    autoScrollEnabled = true
                     prefs.edit()
                         .putString("server", serverInput.text.toString().trim())
                         .putString("psk", pskInput.text.toString().trim())
@@ -179,6 +181,7 @@ __        ___       ____  __  __    __     ______  _   _
                         .putBoolean("check_conn", checkConnSwitch.isChecked)
                         .apply()
                     VpnStateBus.checkConnectionEnabled = checkConnSwitch.isChecked
+                    Mobile.setCheckConnection(checkConnSwitch.isChecked)
                     prepareAndStartVpn()
                 }
             }
@@ -252,7 +255,7 @@ __        ___       ____  __  __    __     ______  _   _
             gravity = Gravity.CENTER_VERTICAL
         }
         val logTitle = TextView(this).apply {
-            text = "Логи подключения (прокручиваемые):"
+            text = "Логи подключения:"
             textSize = 13f
             setTextColor(Color.parseColor("#B0BEC5"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -263,6 +266,7 @@ __        ___       ____  __  __    __     ______  _   _
             setOnClickListener {
                 VpnStateBus.clearLogs()
                 logText.text = ""
+                autoScrollEnabled = true
             }
         }
         logHeaderRow.addView(logTitle)
@@ -280,7 +284,6 @@ __        ___       ____  __  __    __     ______  _   _
             setBackgroundColor(Color.parseColor("#0D1117"))
             isVerticalScrollBarEnabled = true
             isScrollbarFadingEnabled = false
-            isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 600
@@ -294,7 +297,23 @@ __        ___       ____  __  __    __     ______  _   _
                 }
                 false
             }
+            setOnScrollChangeListener { v, _, scrollY, _, _ ->
+                val child = (v as ScrollView).getChildAt(0)
+                if (child != null) {
+                    val diff = child.bottom - (v.height + scrollY)
+                    autoScrollEnabled = (diff <= 60)
+                }
+            }
             addView(logText)
+        }
+
+        // Гарантированный автоскролл вниз сразу после перерасчёта высоты текста
+        logText.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
+            if (bottom > oldBottom && autoScrollEnabled) {
+                logScroll.post {
+                    logScroll.scrollTo(0, bottom)
+                }
+            }
         }
 
         layout.addView(logoView)
@@ -319,7 +338,7 @@ __        ___       ____  __  __    __     ______  _   _
         VpnStateBus.stateListeners.add(stateListener)
 
         applyStateUi(VpnStateBus.currentState)
-        logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        logScroll.post { logScroll.scrollTo(0, logText.bottom) }
     }
 
     override fun onDestroy() {
@@ -330,13 +349,12 @@ __        ___       ____  __  __    __     ______  _   _
 
     private fun showCheckConnectionInfoDialog() {
         AlertDialog.Builder(this)
-            .setTitle("Проверка соединения")
+            .setTitle("Проверка соединения (Watchdog)")
             .setMessage(
                 "При включённом переключателе и активном VPN-туннеле приложение автоматически отслеживает его работоспособность:\n\n" +
-                "1. Раз в случайный интервал от 30 до 60 секунд отправляется тестовый ping 1.1.1.1.\n\n" +
-                "2. Если ping не прошёл, приложение выдерживает случайную паузу от 10 до 20 секунд и отправляет повторный ping 1.1.1.1.\n\n" +
-                "3. Если повторная проверка снова неудачна, VPN-соединение автоматически перезапускается.\n\n" +
-                "Случайные интервалы используются для предотвращения создания предсказуемой периодической сигнатуры трафика."
+                "1. Пассивный контроль: если в течение последних 30–60 секунд через туннель уже приходили данные, лишних проверок не отправляется.\n\n" +
+                "2. В простое отправляется служебный WinRM KeepAlive фрейм (размером под SOAP-ответ).\n\n" +
+                "3. Если ответа нет, через 10–20 секунд выполняется повторная проверка, и при повторной неудаче VPN автоматически переподключается."
             )
             .setPositiveButton("Понятно", null)
             .show()

@@ -1,23 +1,20 @@
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::pin::Pin;
 use std::sync::Arc;
 
-use rustls::crypto::ring;
-use rustls::ServerConfig;
+use openssl::ssl::{AlpnError, Ssl, SslAcceptor, SslFiletype, SslMethod, SslOptions, SslVersion};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
+use tokio_openssl::SslStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 5 {
-        eprintln!("WinRM Rustls TLS Front-End (Windows Server AES-GCM only, NO ChaCha20)");
+        eprintln!("WinRM OpenSSL 3 TLS Front-End (Windows Schannel: TLS 1.2 CBC + AES-GCM, NO ChaCha20)");
         eprintln!("Usage: {} <listen_addr> <backend_addr> <cert.pem> <key.pem>", args[0]);
-        eprintln!("Example: {} 0.0.0.0:5986 127.0.0.1:15986 winrm_cert.pem winrm_key.pem", args[0]);
         std::process::exit(1);
     }
 
@@ -26,34 +23,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cert_path = &args[3];
     let key_path = &args[4];
 
-    // Загружаем сертификат и приватный ключ, сгенерированные winrm-vpn-server
-    let mut cert_reader = BufReader::new(File::open(cert_path)?);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    // Настраиваем OpenSSL 3 под профиль Windows Server 2022/2025 Schannel:
+    // - TLS 1.3 строго AES-GCM (без ChaCha20)
+    // - TLS 1.2 с поддержкой CBC-шифров (ECDHE-RSA-AES256-SHA384 и др.)
+    // - Без ALPN h2
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
+    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+    builder.set_certificate_chain_file(cert_path)?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+    builder.set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")?;
+    builder.set_cipher_list(
+        "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:\
+         ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:\
+         ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:\
+         AES256-GCM-SHA384:AES128-GCM-SHA256:\
+         AES256-SHA256:AES128-SHA256:\
+         AES256-SHA:AES128-SHA:@SECLEVEL=1",
+    )?;
+    builder.set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
+    builder.set_groups_list("X25519:P-256:P-384")?;
+    builder.set_alpn_select_callback(|_, _| Err(AlpnError::NOACK));
 
-    let mut key_reader = BufReader::new(File::open(key_path)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or("no private key found in key file")?;
+    let acceptor = Arc::new(builder.build());
 
-    // Настраиваем CryptoProvider строго БЕЗ ChaCha20 (как в Windows Server 2022/2025 Schannel)
-    let mut provider = ring::default_provider();
-    provider.cipher_suites = vec![
-        ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
-        ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
-        ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-    ];
-
-    let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    // WinRM http.sys не использует ALPN h2
-    config.alpn_protocols.clear();
-
-    let acceptor = TlsAcceptor::from(Arc::new(config));
-
-    // Выставляем IP_TTL = 128 на слушающий сокет (как в Windows Server, без root)
+    // Выставляем IP_TTL = 128 на слушающий сокет (как в Windows Server)
     let addr: SocketAddr = listen_addr.parse()?;
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -65,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
 
-    println!("[rustls] Listening on {} -> backend {} (AES-GCM only, ChaCha20 disabled, TTL=128)", listen_addr, backend_addr);
+    println!(
+        "[openssl3] Listening on {} -> backend {} (Schannel CBC+GCM, ChaCha20 disabled, TTL=128)",
+        listen_addr, backend_addr
+    );
 
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -77,10 +74,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
-            let mut tls_stream = match acceptor.accept(stream).await {
+            let ssl = match Ssl::new(acceptor.context()) {
                 Ok(s) => s,
                 Err(_) => return,
             };
+            let mut tls_stream = match SslStream::new(ssl, stream) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if Pin::new(&mut tls_stream).accept().await.is_err() {
+                return;
+            }
             let mut back_stream = match TcpStream::connect(&backend).await {
                 Ok(s) => s,
                 Err(_) => return,

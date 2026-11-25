@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,7 +32,7 @@ import (
 )
 
 const (
-	AppVersion         = "0.1.1"
+	AppVersion         = "0.2.0"
 	maxConnectAttempts = 3
 	ctlMetaPath        = "/tmp/winrm-vpn-ctl.json"
 )
@@ -56,15 +57,17 @@ type StatusResponse struct {
 }
 
 var (
-	stateMu    sync.RWMutex
-	curState   = "CONNECTING"
-	logsBuf    []string
-	checkConn  bool
-	activeMu   sync.Mutex
-	activeConn net.Conn
-	stopCh     = make(chan struct{})
-	reconnCh   = make(chan struct{}, 1)
-	stopOnce   sync.Once
+	stateMu       sync.RWMutex
+	curState      = "CONNECTING"
+	logsBuf       []string
+	checkConn     atomic.Bool
+	lastRxNano    atomic.Int64
+	activeMu      sync.Mutex
+	activeRecvRaw net.Conn
+	activeSendRaw net.Conn
+	stopCh        = make(chan struct{})
+	reconnCh      = make(chan struct{}, 1)
+	stopOnce      sync.Once
 )
 
 func addLog(format string, args ...any) {
@@ -83,19 +86,16 @@ func setState(s string) {
 	stateMu.Unlock()
 }
 
-func getState() string {
-	stateMu.RLock()
-	defer stateMu.RUnlock()
-	return curState
-}
-
 func triggerReconnect() {
 	activeMu.Lock()
-	if activeConn != nil {
-		_ = activeConn.Close()
-	}
+	r, s := activeRecvRaw, activeSendRaw
 	activeMu.Unlock()
-
+	if r != nil {
+		_ = r.Close()
+	}
+	if s != nil {
+		_ = s.Close()
+	}
 	select {
 	case reconnCh <- struct{}{}:
 	default:
@@ -105,18 +105,23 @@ func triggerReconnect() {
 func triggerStop() {
 	stopOnce.Do(func() {
 		close(stopCh)
-		activeMu.Lock()
-		if activeConn != nil {
-			_ = activeConn.Close()
-		}
-		activeMu.Unlock()
 	})
+}
+
+func gracefulTLSClose(uConn *utls.UConn, rawConn net.Conn) {
+	if rawConn != nil {
+		_ = rawConn.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+	}
+	if uConn != nil {
+		_ = uConn.Close()
+	} else if rawConn != nil {
+		_ = rawConn.Close()
+	}
 }
 
 func main() {
 	cfgPath := flag.String("config", "", "Path to JSON config")
 	flag.Parse()
-
 	if *cfgPath == "" {
 		fmt.Println("Usage: winrm-vpn-helper -config <path>")
 		os.Exit(1)
@@ -124,28 +129,21 @@ func main() {
 
 	raw, err := os.ReadFile(*cfgPath)
 	if err != nil {
-		fmt.Printf("Read config failed: %v\n", err)
 		os.Exit(1)
 	}
 	var cfg HelperConfig
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		fmt.Printf("Parse config failed: %v\n", err)
 		os.Exit(1)
 	}
-	_ = os.Remove(*cfgPath) // Не оставляем файл с PSK на диске
-
-	stateMu.Lock()
-	checkConn = cfg.CheckConn
-	stateMu.Unlock()
+	_ = os.Remove(*cfgPath)
+	checkConn.Store(cfg.CheckConn)
 
 	hostOnly, _, err := net.SplitHostPort(cfg.Server)
 	if err != nil || hostOnly == "" {
-		fmt.Printf("Invalid server address: %s\n", cfg.Server)
 		os.Exit(1)
 	}
 	serverIPs, err := net.LookupIP(hostOnly)
 	if err != nil || len(serverIPs) == 0 {
-		fmt.Printf("Cannot resolve server IP: %v\n", err)
 		os.Exit(1)
 	}
 	serverIPv4 := ""
@@ -156,12 +154,10 @@ func main() {
 		}
 	}
 	if serverIPv4 == "" {
-		fmt.Println("No IPv4 address for server")
 		os.Exit(1)
 	}
 
 	if err := startControlServer(); err != nil {
-		fmt.Printf("Control server error: %v\n", err)
 		os.Exit(1)
 	}
 	defer os.Remove(ctlMetaPath)
@@ -173,19 +169,18 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		addLog("[MAC] Получен сигнал завершения...")
+		addLog("[MAC] Завершение работы...")
 		triggerStop()
 	}()
 
-	go runHealthCheckLoop()
 	go runNetworkSwitchMonitor(netState)
 
 	expectedPin := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(cfg.Pin), ":", ""))
+	var sessionID [16]byte
+	_, _ = rand.Read(sessionID[:])
 
 	var utunFile *os.File
-	var utunName string
-	tunRxCh := make(chan []byte, 128)
-
+	tunRxCh := make(chan []byte, 256)
 	defer func() {
 		if utunFile != nil {
 			_ = utunFile.Close()
@@ -196,7 +191,7 @@ func main() {
 		if utunFile != nil {
 			return utunFile, nil
 		}
-		addLog("[MAC] Авторизация пройдена. Открываю utun и настраиваю маршруты...")
+		addLog("[MAC] Авторизация пройдена. Открываю utun...")
 		f, name, err := openMacUtun()
 		if err != nil {
 			return nil, err
@@ -206,8 +201,7 @@ func main() {
 			return nil, err
 		}
 		utunFile = f
-		utunName = name
-		addLog("[MAC] Интерфейс %s поднят (10.88.0.2 -> 10.88.0.1, DNS 1.1.1.1).", utunName)
+		addLog("[MAC] Интерфейс %s поднят (10.88.0.2, DNS 1.1.1.1).", name)
 
 		go func(tf *os.File) {
 			buf := make([]byte, 4+2048)
@@ -216,7 +210,6 @@ func main() {
 				if err != nil {
 					return
 				}
-				// На macOS первые 4 байта — семейство протоколов (AF_INET = 2)
 				if n > 4+20 && buf[3] == 2 && (buf[4]>>4) == 4 {
 					pkt := make([]byte, n-4)
 					copy(pkt, buf[4:n])
@@ -252,7 +245,7 @@ func main() {
 		addLog("[SYS] Попытка подключения %d/%d...", attempt, maxConnectAttempts)
 		setState("CONNECTING")
 
-		wasConnected, err := runSingleSession(cfg.Server, cfg.PSK, expectedPin, ensureTun, tunRxCh)
+		wasConnected, rotated, err := runDualChannelSession(cfg.Server, cfg.PSK, expectedPin, sessionID, ensureTun, tunRxCh)
 		if err != nil {
 			addLog("[ERR] Session ended: %v", err)
 		}
@@ -265,6 +258,11 @@ func main() {
 			setState("DISCONNECTED")
 			return
 		default:
+		}
+
+		if rotated {
+			addLog("[SYS] Плановая ротация сокетов WinRM...")
+			continue
 		}
 
 		if attempt >= maxConnectAttempts {
@@ -283,7 +281,8 @@ func main() {
 			return
 		case <-reconnCh:
 			attempt = 0
-			addLog("[SYS] Немедленное переподключение...")
+			_, _ = rand.Read(sessionID[:])
+			addLog("[SYS] Переключение сети — переподключение...")
 		case <-time.After(time.Duration(delayMs) * time.Millisecond):
 		}
 	}
@@ -319,11 +318,7 @@ func startControlServer() error {
 		stateMu.RLock()
 		logsCopy := make([]string, len(logsBuf))
 		copy(logsCopy, logsBuf)
-		resp := StatusResponse{
-			State:     curState,
-			CheckConn: checkConn,
-			Logs:      logsCopy,
-		}
+		resp := StatusResponse{State: curState, CheckConn: checkConn.Load(), Logs: logsCopy}
 		stateMu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -335,9 +330,7 @@ func startControlServer() error {
 			return
 		}
 		enabled := r.URL.Query().Get("enabled") == "true"
-		stateMu.Lock()
-		checkConn = enabled
-		stateMu.Unlock()
+		checkConn.Store(enabled)
 		addLog("[UI] Проверка соединения (Watchdog): %v", map[bool]string{true: "ВКЛ", false: "ВЫКЛ"}[enabled])
 		_, _ = w.Write([]byte("OK"))
 	})
@@ -349,15 +342,14 @@ func startControlServer() error {
 		}
 		addLog("[PING] Running ping -c 1 -W 3000 8.8.8.8 ...")
 		out, err := exec.Command("/sbin/ping", "-c", "1", "-W", "3000", "8.8.8.8").CombinedOutput()
-		text := string(out)
 		if err == nil {
 			re := regexp.MustCompile(`time=([0-9.]+\s*ms)`)
 			rtt := ""
-			if m := re.FindStringSubmatch(text); len(m) > 1 {
+			if m := re.FindStringSubmatch(string(out)); len(m) > 1 {
 				rtt = " (" + m[1] + ")"
 			}
 			msg := "✓ Тестовый пинг 8.8.8.8 прошел" + rtt
-			addLog("[PING] SUCCESS: 8.8.8.8 reachable%s", rtt)
+			addLog("[PING] SUCCESS%s", rtt)
 			_, _ = w.Write([]byte(msg))
 		} else {
 			msg := fmt.Sprintf("✗ Ошибка: пинг 8.8.8.8 не прошел (%v)", err)
@@ -376,20 +368,17 @@ func startControlServer() error {
 		cc, err1 := httpGetCurl("http://ifconfig.io/country_code")
 		host, err2 := httpGetCurl("http://ifconfig.io/host")
 		if err1 != nil || err2 != nil {
-			err := err1
-			if err == nil {
-				err = err2
+			e := err1
+			if e == nil {
+				e = err2
 			}
-			msg := fmt.Sprintf("✗ Ошибка проверки IP: %v", err)
-			addLog("[IP-CHECK] ERROR: %v", err)
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte(msg))
+			_, _ = w.Write([]byte(fmt.Sprintf("✗ Ошибка: %v", e)))
 			return
 		}
 		cc = strings.ToUpper(strings.TrimSpace(cc))
 		host = strings.TrimSpace(host)
-		flagEmoji := countryCodeToFlag(cc)
-		res := fmt.Sprintf("%s %s  |  IP/Host: %s", flagEmoji, cc, host)
+		res := fmt.Sprintf("%s %s  |  IP/Host: %s", countryCodeToFlag(cc), cc, host)
 		addLog("[IP-CHECK] Result: %s", res)
 		_, _ = w.Write([]byte(res))
 	})
@@ -407,9 +396,7 @@ func startControlServer() error {
 		}()
 	})
 
-	go func() {
-		_ = http.Serve(ln, mux)
-	}()
+	go func() { _ = http.Serve(ln, mux) }()
 	return nil
 }
 
@@ -427,77 +414,6 @@ func runNetworkSwitchMonitor(netState *MacNetworkState) {
 			}
 		}
 	}
-}
-
-func runHealthCheckLoop() {
-	for {
-		select {
-		case <-stopCh:
-			return
-		default:
-		}
-		stateMu.RLock()
-		enabled := checkConn
-		st := curState
-		stateMu.RUnlock()
-
-		if !enabled || st != "CONNECTED" {
-			select {
-			case <-stopCh:
-				return
-			case <-time.After(1 * time.Second):
-			}
-			continue
-		}
-
-		waitSec := 30 + mathrand.Intn(31)
-		if !interruptibleSleepSec(waitSec) {
-			continue
-		}
-		if pingMac("1.1.1.1") {
-			addLog("[WATCHDOG] ping 1.1.1.1 OK (след. через 30-60с)")
-			continue
-		}
-
-		retrySec := 10 + mathrand.Intn(11)
-		addLog("[WATCHDOG] ping 1.1.1.1 не прошёл! Повтор через %dс...", retrySec)
-		if !interruptibleSleepSec(retrySec) {
-			continue
-		}
-		if pingMac("1.1.1.1") {
-			addLog("[WATCHDOG] Повторный ping 1.1.1.1 OK")
-		} else {
-			addLog("[WATCHDOG] Повторный ping 1.1.1.1 не прошёл! Перезапуск VPN...")
-			triggerReconnect()
-			select {
-			case <-stopCh:
-				return
-			case <-time.After(2 * time.Second):
-			}
-		}
-	}
-}
-
-func interruptibleSleepSec(sec int) bool {
-	for i := 0; i < sec; i++ {
-		stateMu.RLock()
-		enabled := checkConn
-		st := curState
-		stateMu.RUnlock()
-		if !enabled || st != "CONNECTED" {
-			return false
-		}
-		select {
-		case <-stopCh:
-			return false
-		case <-time.After(1 * time.Second):
-		}
-	}
-	return true
-}
-
-func pingMac(host string) bool {
-	return exec.Command("/sbin/ping", "-c", "1", "-W", "3000", host).Run() == nil
 }
 
 func httpGetCurl(urlStr string) (string, error) {
@@ -521,109 +437,83 @@ func httpGetCurl(urlStr string) (string, error) {
 }
 
 func countryCodeToFlag(code string) string {
-	if len(code) != 2 {
+	if len(code) != 2 || code[0] < 'A' || code[0] > 'Z' || code[1] < 'A' || code[1] > 'Z' {
 		return "🏳️"
 	}
-	r0 := rune(0x1F1E6) + rune(code[0]-'A')
-	r1 := rune(0x1F1E6) + rune(code[1]-'A')
-	if code[0] < 'A' || code[0] > 'Z' || code[1] < 'A' || code[1] > 'Z' {
-		return "🏳️"
-	}
-	return string([]rune{r0, r1})
+	return string([]rune{rune(0x1F1E6) + rune(code[0]-'A'), rune(0x1F1E6) + rune(code[1]-'A')})
 }
 
-func runSingleSession(
-	serverAddr, psk, expectedPin string,
-	ensureTun func() (*os.File, error),
-	tunRxCh <-chan []byte,
-) (bool, error) {
-	addLog("[TCP] Dialing %s (IPv4)...", serverAddr)
-
-	dialer := &net.Dialer{Timeout: 4 * time.Second}
-	rawConn, err := dialer.Dial("tcp4", serverAddr)
+func dialWinRMChannel(serverAddr, psk, expectedPin string, sessionID [16]byte, role byte, verbose bool) (net.Conn, *utls.UConn, *bufio.Reader, error) {
+	rawConn, err := (&net.Dialer{Timeout: 4 * time.Second}).Dial("tcp4", serverAddr)
 	if err != nil {
-		return false, fmt.Errorf("TCP connect failed: %w", err)
+		return nil, nil, nil, fmt.Errorf("TCP connect failed: %w", err)
 	}
-
-	activeMu.Lock()
-	activeConn = rawConn
-	activeMu.Unlock()
-
-	defer func() {
-		activeMu.Lock()
-		if activeConn == rawConn {
-			activeConn = nil
-		}
-		activeMu.Unlock()
-		_ = rawConn.Close()
-	}()
-
 	_ = rawConn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	addLog("[TCP] Connected to %s", rawConn.RemoteAddr().String())
-	addLog("[TLS] Handshake (Profile: Ansible / OpenSSL 3.x, no SNI)...")
 
 	uConn := utls.UClient(rawConn, &utls.Config{InsecureSkipVerify: true}, utls.HelloCustom)
 	if err := uConn.ApplyPreset(buildAnsibleOpenSSL3Spec()); err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	if err := uConn.Handshake(); err != nil {
-		return false, fmt.Errorf("TLS handshake failed: %w", err)
+		_ = rawConn.Close()
+		return nil, nil, nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
 	state := uConn.ConnectionState()
-	addLog("[TLS] Handshake OK (Cipher: %s)", tls.CipherSuiteName(state.CipherSuite))
-
 	if len(state.PeerCertificates) == 0 {
-		return false, errors.New("server provided no certificate")
+		_ = rawConn.Close()
+		return nil, nil, nil, errors.New("no cert")
 	}
 	h := sha256.Sum256(state.PeerCertificates[0].Raw)
 	gotPin := hex.EncodeToString(h[:])
-	addLog("[TLS] Cert CN=%s, SHA-256=%s...", state.PeerCertificates[0].Subject.CommonName, gotPin[:16])
-
-	if expectedPin != "" {
-		if gotPin != expectedPin {
-			return false, fmt.Errorf("Cert Pin mismatch! Got %s...", gotPin[:12])
-		}
-		addLog("[TLS] Certificate Pin verified OK")
+	if verbose {
+		addLog("[TLS] OK (%s), Cert CN=%s, Pin=%s...",
+			tls.CipherSuiteName(state.CipherSuite), state.PeerCertificates[0].Subject.CommonName, gotPin[:12])
+	}
+	if expectedPin != "" && gotPin != expectedPin {
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("Cert Pin mismatch! Got %s...", gotPin[:12])
 	}
 
 	br := bufio.NewReader(uConn)
 	soapBody := common.BuildSoapCreateShellXML(serverAddr)
 
-	// Шаг 1/3: без Authorization
-	addLog("[HTTP 1/3] -> POST %s (no auth, SOAP %dB)", common.WinRMPath, len(soapBody))
 	req0 := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n%s",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, len(soapBody), soapBody)
 	if _, err := io.WriteString(uConn, req0); err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	resp0, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	_, _ = io.Copy(io.Discard, resp0.Body)
 	_ = resp0.Body.Close()
 	if resp0.StatusCode != 401 {
-		return false, fmt.Errorf("expected 401 on step 1/3, got %d", resp0.StatusCode)
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("expected 401 on 1/3, got %d", resp0.StatusCode)
 	}
 
-	// Шаг 2/3: NTLM Type 1
-	addLog("[HTTP 2/3] -> POST %s (NTLM Type 1)", common.WinRMPath)
 	t1 := common.BuildNTLMType1()
 	req1 := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nAuthorization: NTLM %s\r\nContent-Length: 0\r\n\r\n",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t1)
 	if _, err := io.WriteString(uConn, req1); err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	resp1, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	_, _ = io.Copy(io.Discard, resp1.Body)
 	_ = resp1.Body.Close()
 	if resp1.StatusCode != 401 {
-		return false, fmt.Errorf("expected 401 on step 2/3, got %d", resp1.StatusCode)
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("expected 401 on 2/3, got %d", resp1.StatusCode)
 	}
 
 	var serverChallenge [8]byte
@@ -643,51 +533,209 @@ func runSingleSession(
 		}
 	}
 	if !found {
-		return false, errors.New("no NTLM Type 2 Challenge")
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, errors.New("no NTLM Type 2 Challenge")
 	}
 
-	// Шаг 3/3: NTLM Type 3 + SOAP
-	addLog("[HTTP 3/3] -> POST %s (NTLM Type 3 + SOAP)", common.WinRMPath)
-	t3 := common.BuildNTLMType3WithAuth(psk, serverChallenge)
+	t3 := common.BuildNTLMType3SessionAuth(psk, serverChallenge, sessionID, role)
 	req2 := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nAuthorization: NTLM %s\r\nContent-Length: %d\r\n\r\n%s",
 		common.WinRMPath, serverAddr, common.WinRMUserAgent, t3, len(soapBody), soapBody)
 	if _, err := io.WriteString(uConn, req2); err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	resp2, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return false, err
+		_ = rawConn.Close()
+		return nil, nil, nil, err
 	}
 	if resp2.StatusCode != 200 {
-		return false, fmt.Errorf("auth rejected (%d) — проверьте PSK или часы", resp2.StatusCode)
+		gracefulTLSClose(uConn, rawConn)
+		return nil, nil, nil, fmt.Errorf("auth rejected (%d)", resp2.StatusCode)
 	}
 	if resp2.ContentLength > 0 {
 		_, _ = io.CopyN(io.Discard, resp2.Body, resp2.ContentLength)
 	}
+	_ = resp2.Body.Close()
 
 	_ = rawConn.SetDeadline(time.Time{})
+	return rawConn, uConn, br, nil
+}
+
+func runDualChannelSession(
+	serverAddr, psk, expectedPin string,
+	sessionID [16]byte,
+	ensureTun func() (*os.File, error),
+	tunRxCh <-chan []byte,
+) (bool, bool, error) {
+	addLog("[HTTP] Открытие канала Receive...")
+	recvRaw, recvU, recvBR, err := dialWinRMChannel(serverAddr, psk, expectedPin, sessionID, common.RoleRecv, true)
+	if err != nil {
+		return false, false, err
+	}
+
+	addLog("[HTTP] Открытие канала Send...")
+	sendRaw, sendU, sendBR, err := dialWinRMChannel(serverAddr, psk, expectedPin, sessionID, common.RoleSend, false)
+	if err != nil {
+		gracefulTLSClose(recvU, recvRaw)
+		return false, false, err
+	}
+
+	activeMu.Lock()
+	activeRecvRaw, activeSendRaw = recvRaw, sendRaw
+	activeMu.Unlock()
 
 	tf, err := ensureTun()
 	if err != nil {
-		return false, err
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+		activeMu.Lock()
+		activeRecvRaw, activeSendRaw = nil, nil
+		activeMu.Unlock()
+		return false, false, err
 	}
 
-	addLog("[VPN] Tunnel ESTABLISHED! Routing IPv4 via WinRM stream.")
+	lastRxNano.Store(time.Now().UnixNano())
+	addLog("[VPN] 2-канальный WinRM туннель активен.")
 	setState("CONNECTED")
 
 	sessionDone := make(chan struct{})
-	defer close(sessionDone)
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
+	kaReqCh := make(chan struct{}, 4)
+	kaAckCh := make(chan struct{}, 4)
+
+	rotateTimer := time.NewTimer(time.Duration(10+mathrand.Intn(6)) * time.Minute)
+	defer rotateTimer.Stop()
 
 	go func() {
 		for {
 			select {
 			case <-sessionDone:
 				return
+			default:
+			}
+			recvSoap := common.BuildSoapReceiveXML(serverAddr)
+			reqStr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n%s",
+				common.WinRMPath, serverAddr, common.WinRMUserAgent, len(recvSoap), recvSoap)
+
+			_ = recvRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(recvU, reqStr); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			_ = recvRaw.SetWriteDeadline(time.Time{})
+
+			resp, err := http.ReadResponse(recvBR, nil)
+			if err != nil || resp.StatusCode != 200 {
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				select {
+				case errCh <- errors.New("recv response failed"):
+				default:
+				}
+				return
+			}
+
+			for {
+				fType, pkts, err := common.DecodeBatchFrame(resp.Body)
+				if err != nil {
+					_ = resp.Body.Close()
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				lastRxNano.Store(time.Now().UnixNano())
+				if fType == common.FrameKeepAlive {
+					select {
+					case kaAckCh <- struct{}{}:
+					default:
+					}
+				} else {
+					for _, pkt := range pkts {
+						if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
+							_ = writeMacUtunIPv4(tf, pkt)
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	go func() {
+		sendBatchHTTP := func(frame []byte) error {
+			hdr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n",
+				common.WinRMPath, serverAddr, common.WinRMUserAgent, len(frame))
+			full := make([]byte, len(hdr)+len(frame))
+			copy(full, hdr)
+			copy(full[len(hdr):], frame)
+
+			_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := sendU.Write(full); err != nil {
+				return err
+			}
+			_ = sendRaw.SetWriteDeadline(time.Time{})
+
+			_ = sendRaw.SetReadDeadline(time.Now().Add(10 * time.Second))
+			resp, err := http.ReadResponse(sendBR, nil)
+			if err != nil {
+				return err
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			_ = sendRaw.SetReadDeadline(time.Time{})
+			if resp.StatusCode != 200 {
+				return fmt.Errorf("send status %d", resp.StatusCode)
+			}
+			return nil
+		}
+
+		for {
+			select {
+			case <-sessionDone:
+				return
 			case <-stopCh:
 				return
-			case pkt := <-tunRxCh:
-				if err := common.WritePaddedFrame(uConn, pkt); err != nil {
+			case <-kaReqCh:
+				if err := sendBatchHTTP(common.EncodeBatchFrame(nil, common.FrameKeepAlive)); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			case firstPkt := <-tunRxCh:
+				pkts := make([][]byte, 1, 24)
+				pkts[0] = firstPkt
+				batchBytes := len(firstPkt)
+
+				cTimer := time.NewTimer(3 * time.Millisecond)
+			drain:
+				for len(pkts) < 24 && batchBytes < 32768 {
+					select {
+					case p := <-tunRxCh:
+						pkts = append(pkts, p)
+						batchBytes += len(p)
+					case <-cTimer.C:
+						break drain
+					}
+				}
+				if !cTimer.Stop() {
+					select {
+					case <-cTimer.C:
+					default:
+					}
+				}
+
+				if err := sendBatchHTTP(common.EncodeBatchFrame(pkts, common.FrameData)); err != nil {
 					select {
 					case errCh <- err:
 					default:
@@ -699,34 +747,98 @@ func runSingleSession(
 	}()
 
 	go func() {
-		scratch := make([]byte, 65536)
 		for {
-			pkt, err := common.ReadPaddedFrame(br, scratch)
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
+			waitSec := 30 + mathrand.Intn(31)
+			select {
+			case <-sessionDone:
+				return
+			case <-stopCh:
+				return
+			case <-time.After(time.Duration(waitSec) * time.Second):
+			}
+			if !checkConn.Load() || time.Since(time.Unix(0, lastRxNano.Load())) < 30*time.Second {
+				continue
+			}
+			for len(kaAckCh) > 0 {
+				<-kaAckCh
+			}
+			select {
+			case kaReqCh <- struct{}{}:
+			default:
+			}
+			got := false
+			select {
+			case <-kaAckCh:
+				got = true
+			case <-time.After(5 * time.Second):
+			case <-sessionDone:
 				return
 			}
-			if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
-				if err := writeMacUtunIPv4(tf, pkt); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
+			if got || time.Since(time.Unix(0, lastRxNano.Load())) < 10*time.Second {
+				addLog("[WATCHDOG] WinRM KeepAlive OK")
+				continue
 			}
+
+			retrySec := 10 + mathrand.Intn(11)
+			addLog("[WATCHDOG] Нет ответа на KeepAlive. Повтор через %dс...", retrySec)
+			select {
+			case <-sessionDone:
+				return
+			case <-stopCh:
+				return
+			case <-time.After(time.Duration(retrySec) * time.Second):
+			}
+			if !checkConn.Load() {
+				continue
+			}
+			select {
+			case kaReqCh <- struct{}{}:
+			default:
+			}
+			got = false
+			select {
+			case <-kaAckCh:
+				got = true
+			case <-time.After(5 * time.Second):
+			case <-sessionDone:
+				return
+			}
+			if got || time.Since(time.Unix(0, lastRxNano.Load())) < 10*time.Second {
+				addLog("[WATCHDOG] Повторный KeepAlive OK")
+				continue
+			}
+			addLog("[WATCHDOG] Повторный KeepAlive не прошёл! Перезапуск...")
+			select {
+			case errCh <- errors.New("watchdog timeout"):
+			default:
+			}
+			return
 		}
 	}()
 
+	var retErr error
+	var isRotate bool
 	select {
 	case <-stopCh:
-		return true, nil
-	case err := <-errCh:
-		return true, err
+		addLog("[VPN] Штатное отключение (TLS close_notify)...")
+		close(sessionDone)
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+	case <-rotateTimer.C:
+		isRotate = true
+		close(sessionDone)
+		gracefulTLSClose(recvU, recvRaw)
+		gracefulTLSClose(sendU, sendRaw)
+	case retErr = <-errCh:
+		close(sessionDone)
+		_ = recvRaw.Close()
+		_ = sendRaw.Close()
 	}
+
+	activeMu.Lock()
+	activeRecvRaw, activeSendRaw = nil, nil
+	activeMu.Unlock()
+	return true, isRotate, retErr
 }
 
 func buildAnsibleOpenSSL3Spec() *utls.ClientHelloSpec {

@@ -19,6 +19,11 @@ const (
 	WinRMPath      = "/wsman"
 	WinRMUserAgent = "Python WinRM client"
 	ServerHeader   = "Microsoft-HTTPAPI/2.0"
+
+	FrameData      byte = 0x00
+	FrameKeepAlive byte = 0x01
+	RoleRecv       byte = 'R'
+	RoleSend       byte = 'S'
 )
 
 const WSManIdentifyResponseXML = `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"><s:Header/><s:Body><wsmid:IdentifyResponse><wsmid:ProtocolVersion>http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd</wsmid:ProtocolVersion><wsmid:ProductVendor>Microsoft Corporation</wsmid:ProductVendor><wsmid:ProductVersion>OS: 0.0.0 SP: 0.0 Stack: 3.0</wsmid:ProductVersion></wsmid:IdentifyResponse></s:Body></s:Envelope>`
@@ -47,7 +52,6 @@ func randomUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// BuildSoapCreateShellXML генерирует уникальный SOAP Create Shell запрос Ansible pywinrm со случайной длиной
 func BuildSoapCreateShellXML(hostAddr string) string {
 	if hostAddr == "" {
 		hostAddr = "windows-host:5986"
@@ -56,12 +60,9 @@ func BuildSoapCreateShellXML(hostAddr string) string {
 	timeouts := []string{"PT60S", "PT120S", "PT180S", "PT300S"}
 	timeout := timeouts[mathrand.Intn(len(timeouts))]
 
-	// Валидные опции WinRM OptionSet + случайный XML-отступ для естественного разброса длины TLS-рекорда
-	extraOpts := ""
+	extraOpts := `<w:OptionSet><w:Option Name="WINRS_NOPROFILE">FALSE</w:Option></w:OptionSet>`
 	if mathrand.Intn(2) == 0 {
 		extraOpts = `<w:OptionSet><w:Option Name="WINRS_NOPROFILE">TRUE</w:Option><w:Option Name="WINRS_CODEPAGE">65001</w:Option></w:OptionSet>`
-	} else {
-		extraOpts = `<w:OptionSet><w:Option Name="WINRS_NOPROFILE">FALSE</w:Option></w:OptionSet>`
 	}
 	padSpaces := strings.Repeat(" ", 4+mathrand.Intn(140))
 
@@ -71,7 +72,6 @@ func BuildSoapCreateShellXML(hostAddr string) string {
 	)
 }
 
-// BuildSoapCreateShellResponseXML генерирует уникальный SOAP CreateResponse с варьируемой длиной
 func BuildSoapCreateShellResponseXML(hostAddr string) string {
 	if hostAddr == "" {
 		hostAddr = "windows-host:5986"
@@ -84,6 +84,32 @@ func BuildSoapCreateShellResponseXML(hostAddr string) string {
 	return fmt.Sprintf(
 		`<s:Envelope xml:lang="en-US" xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:x="http://schemas.xmlsoap.org/ws/2004/09/transfer" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/CreateResponse</a:Action><a:MessageID>uuid:%s</a:MessageID><a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To><a:RelatesTo>uuid:%s</a:RelatesTo></s:Header><s:Body><x:ResourceCreated><a:Address>https://%s/wsman</a:Address><a:ReferenceParameters><w:ResourceURI>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><w:SelectorSet><w:Selector Name="ShellId">%s</w:Selector></w:SelectorSet></a:ReferenceParameters></x:ResourceCreated><rsp:Shell xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><rsp:ShellId>%s</rsp:ShellId><rsp:InputStreams>stdin</rsp:InputStreams><rsp:OutputStreams>stdout stderr</rsp:OutputStreams></rsp:Shell>%s</s:Body></s:Envelope>`,
 		msgID, relID, hostAddr, shellID, shellID, padSpaces,
+	)
+}
+
+func BuildSoapReceiveXML(hostAddr string) string {
+	if hostAddr == "" {
+		hostAddr = "windows-host:5986"
+	}
+	msgID := randomUUID()
+	shellID := strings.ToUpper(randomUUID())
+	padSpaces := strings.Repeat(" ", 4+mathrand.Intn(96))
+	return fmt.Sprintf(
+		`<?xml version="1.0" encoding="UTF-8"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><env:Header><a:To>https://%s/wsman</a:To><w:MaxEnvelopeSize mustUnderstand="true">153600</w:MaxEnvelopeSize><a:MessageID>uuid:%s</a:MessageID><w:OperationTimeout>PT60S</w:OperationTimeout><w:ResourceURI mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI><a:Action mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive</a:Action><w:SelectorSet><w:Selector Name="ShellId">%s</w:Selector></w:SelectorSet></env:Header><env:Body><rsp:Receive><rsp:DesiredStream>stdout stderr</rsp:DesiredStream></rsp:Receive>%s</env:Body></env:Envelope>`,
+		hostAddr, msgID, shellID, padSpaces,
+	)
+}
+
+func BuildSoapSendResponseXML(hostAddr string) string {
+	if hostAddr == "" {
+		hostAddr = "windows-host:5986"
+	}
+	msgID := strings.ToUpper(randomUUID())
+	relID := randomUUID()
+	padSpaces := strings.Repeat(" ", 4+mathrand.Intn(120))
+	return fmt.Sprintf(
+		`<s:Envelope xml:lang="en-US" xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Header><a:Action>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/SendResponse</a:Action><a:MessageID>uuid:%s</a:MessageID><a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To><a:RelatesTo>uuid:%s</a:RelatesTo></s:Header><s:Body><rsp:SendResponse/>%s</s:Body></s:Envelope>`,
+		msgID, relID, padSpaces,
 	)
 }
 
@@ -161,7 +187,8 @@ func BuildNTLMType2(hostName string) (string, [8]byte) {
 	return base64.StdEncoding.EncodeToString(buf), challenge
 }
 
-func BuildNTLMType3WithAuth(psk string, serverChallenge [8]byte) string {
+// BuildNTLMType3SessionAuth прячет HMAC-токен, SessionID и роль канала ('R'/'S') внутри NtChallengeResponse
+func BuildNTLMType3SessionAuth(psk string, serverChallenge [8]byte, sessionID [16]byte, role byte) string {
 	ts := make([]byte, 8)
 	binary.BigEndian.PutUint64(ts, uint64(time.Now().Unix()))
 
@@ -172,17 +199,21 @@ func BuildNTLMType3WithAuth(psk string, serverChallenge [8]byte) string {
 	mac.Write(serverChallenge[:])
 	mac.Write(ts)
 	mac.Write(nonce)
+	mac.Write(sessionID[:])
+	mac.Write([]byte{role})
 	sig := mac.Sum(nil)
 
 	var randLenByte [1]byte
 	_, _ = rand.Read(randLenByte[:])
-	padLen := 48 + int(randLenByte[0]%96)
+	padLen := 32 + int(randLenByte[0]%80)
 	pad := make([]byte, padLen)
 	_, _ = rand.Read(pad)
 
-	ntResp := make([]byte, 0, 8+16+32+padLen)
+	ntResp := make([]byte, 0, 8+16+16+1+32+padLen)
 	ntResp = append(ntResp, ts...)
 	ntResp = append(ntResp, nonce...)
+	ntResp = append(ntResp, sessionID[:]...)
+	ntResp = append(ntResp, role)
 	ntResp = append(ntResp, sig...)
 	ntResp = append(ntResp, pad...)
 
@@ -213,55 +244,44 @@ func BuildNTLMType3WithAuth(psk string, serverChallenge [8]byte) string {
 	return base64.StdEncoding.EncodeToString(buf)
 }
 
-func VerifyNTLMType3Auth(b64Token string, psk string, serverChallenge [8]byte) bool {
+func VerifyNTLMType3SessionAuth(b64Token string, psk string, serverChallenge [8]byte) (sessionID [16]byte, role byte, ok bool) {
 	raw, err := base64.StdEncoding.DecodeString(b64Token)
 	if err != nil || len(raw) < 88 {
-		return false
+		return sessionID, 0, false
 	}
 	if string(raw[0:8]) != "NTLMSSP\x00" || binary.LittleEndian.Uint32(raw[8:12]) != 3 {
-		return false
+		return sessionID, 0, false
 	}
 	ntLen := int(binary.LittleEndian.Uint16(raw[20:22]))
 	ntOff := int(binary.LittleEndian.Uint32(raw[24:28]))
-	if ntOff < 0 || ntLen < (8+16+32) || ntOff+ntLen > len(raw) {
-		return false
+	if ntOff < 0 || ntLen < (8+16+16+1+32) || ntOff+ntLen > len(raw) {
+		return sessionID, 0, false
 	}
 	ntResp := raw[ntOff : ntOff+ntLen]
 	tsBytes := ntResp[0:8]
 	nonce := ntResp[8:24]
-	gotSig := ntResp[24:56]
+	copy(sessionID[:], ntResp[24:40])
+	role = ntResp[40]
+	gotSig := ntResp[41:73]
 
 	ts := int64(binary.BigEndian.Uint64(tsBytes))
 	now := time.Now().Unix()
 	if ts < now-120 || ts > now+120 {
-		return false
+		return sessionID, 0, false
 	}
 
 	mac := hmac.New(sha256.New, []byte(psk))
 	mac.Write(serverChallenge[:])
 	mac.Write(tsBytes)
 	mac.Write(nonce)
+	mac.Write(sessionID[:])
+	mac.Write([]byte{role})
 	expectedSig := mac.Sum(nil)
 
-	return hmac.Equal(gotSig, expectedSig)
-}
-
-func isInnerTLSHandshake(ipPkt []byte) bool {
-	if len(ipPkt) < 43 || (ipPkt[0]>>4) != 4 || ipPkt[9] != 6 {
-		return false
+	if !hmac.Equal(gotSig, expectedSig) {
+		return sessionID, 0, false
 	}
-	ihl := int(ipPkt[0]&0x0f) * 4
-	if len(ipPkt) < ihl+20 {
-		return false
-	}
-	tcpDataOff := int(ipPkt[ihl+12]>>4) * 4
-	payloadStart := ihl + tcpDataOff
-	if len(ipPkt) < payloadStart+3 {
-		return false
-	}
-	contentType := ipPkt[payloadStart]
-	tlsMajor := ipPkt[payloadStart+1]
-	return (contentType == 0x16 || contentType == 0x14) && tlsMajor == 0x03
+	return sessionID, role, true
 }
 
 func fillFastRandom(b []byte) {
@@ -273,88 +293,95 @@ func fillFastRandom(b []byte) {
 	}
 }
 
-func WritePaddedFrame(w io.Writer, ipPkt []byte) error {
-	pktLen := len(ipPkt)
-	if pktLen > 65535 {
-		return errors.New("packet too large")
+// EncodeBatchFrame упаковывает пачку IPv4-пакетов (или KeepAlive) в единый блок для HTTP-отправки.
+// - Мелкие блоки выравниваются под размер SOAP-сообщений (480..1280 Б), убирая паттерн коротких ACK.
+// - Крупные блоки пишутся целиком, чтобы TCP-стек заполнял полные MSS (1448/1460 Б) без лишних PSH,ACK.
+func EncodeBatchFrame(pkts [][]byte, frameType byte) []byte {
+	payloadSize := 0
+	for _, p := range pkts {
+		payloadSize += 2 + len(p)
 	}
 
-	innerTLS := isInnerTLSHandshake(ipPkt)
+	rawSize := 5 + payloadSize
 	padLen := 0
 
-	if innerTLS {
-		padLen = 150 + mathrand.Intn(550)
-	} else if pktLen > 0 && pktLen < 450 {
-		target := 160 + mathrand.Intn(360)
-		if target > pktLen {
-			padLen = target - pktLen
+	if frameType == FrameKeepAlive {
+		target := 850 + mathrand.Intn(450)
+		if target > rawSize {
+			padLen = target - rawSize
 		}
+	} else if rawSize < 512 {
+		target := 480 + mathrand.Intn(800)
+		if target > rawSize {
+			padLen = target - rawSize
+		}
+	} else if rawSize < 1350 {
+		padLen = mathrand.Intn(96)
 	}
 
-	totalLen := 4 + pktLen + padLen
-	buf := make([]byte, totalLen)
-	binary.BigEndian.PutUint16(buf[0:2], uint16(pktLen))
-	binary.BigEndian.PutUint16(buf[2:4], uint16(padLen))
-	copy(buf[4:4+pktLen], ipPkt)
+	buf := make([]byte, rawSize+padLen)
+	buf[0] = frameType
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(pkts)))
+	binary.BigEndian.PutUint16(buf[3:5], uint16(padLen))
+
+	off := 5
+	for _, p := range pkts {
+		binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(p)))
+		off += 2
+		copy(buf[off:off+len(p)], p)
+		off += len(p)
+	}
 	if padLen > 0 {
-		fillFastRandom(buf[4+pktLen:])
+		fillFastRandom(buf[off:])
 	}
-
-	if innerTLS && totalLen > 220 {
-		parts := 2 + mathrand.Intn(2)
-		offset := 0
-		for p := 0; p < parts; p++ {
-			remaining := totalLen - offset
-			var chunkLen int
-			if p == parts-1 {
-				chunkLen = remaining
-			} else {
-				minChunk := 64
-				maxChunk := remaining - (parts-1-p)*minChunk
-				if maxChunk <= minChunk {
-					chunkLen = remaining
-				} else {
-					chunkLen = minChunk + mathrand.Intn(maxChunk-minChunk)
-				}
-			}
-			if _, err := w.Write(buf[offset : offset+chunkLen]); err != nil {
-				return err
-			}
-			offset += chunkLen
-			if offset >= totalLen {
-				break
-			}
-			time.Sleep(time.Duration(1+mathrand.Intn(3)) * time.Millisecond)
-		}
-		return nil
-	}
-
-	if pktLen >= 450 && mathrand.Intn(2) == 0 {
-		cut := totalLen/4 + mathrand.Intn(totalLen/2)
-		if _, err := w.Write(buf[:cut]); err != nil {
-			return err
-		}
-		_, err := w.Write(buf[cut:])
-		return err
-	}
-
-	_, err := w.Write(buf)
-	return err
+	return buf
 }
 
-func ReadPaddedFrame(r io.Reader, scratch []byte) ([]byte, error) {
-	var hdr [4]byte
+// DecodeBatchFrame читает один батч-фрейм из HTTP Body (Send или chunked Receive)
+func DecodeBatchFrame(r io.Reader) (frameType byte, pkts [][]byte, err error) {
+	var hdr [5]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	pktLen := int(binary.BigEndian.Uint16(hdr[0:2]))
-	padLen := int(binary.BigEndian.Uint16(hdr[2:4]))
+	frameType = hdr[0]
+	count := int(binary.BigEndian.Uint16(hdr[1:3]))
+	padLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+	if count > 512 || padLen > 65535 {
+		return 0, nil, errors.New("invalid batch header")
+	}
 
-	if pktLen+padLen > len(scratch) {
-		return nil, errors.New("frame exceeds buffer")
+	pkts = make([][]byte, 0, count)
+	var lenBuf [2]byte
+	for i := 0; i < count; i++ {
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			return 0, nil, err
+		}
+		pLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+		if pLen > 65535 {
+			return 0, nil, errors.New("packet too large")
+		}
+		pkt := make([]byte, pLen)
+		if _, err := io.ReadFull(r, pkt); err != nil {
+			return 0, nil, err
+		}
+		pkts = append(pkts, pkt)
 	}
-	if _, err := io.ReadFull(r, scratch[:pktLen+padLen]); err != nil {
-		return nil, err
+
+	if padLen > 0 {
+		if _, err := io.CopyN(io.Discard, r, int64(padLen)); err != nil {
+			return 0, nil, err
+		}
 	}
-	return scratch[:pktLen], nil
+	return frameType, pkts, nil
+}
+
+// WriteHTTPChunk отправляет один батч в виде HTTP/1.1 chunk одним вызовом Write()
+func WriteHTTPChunk(w io.Writer, payload []byte) error {
+	hdr := fmt.Sprintf("%x\r\n", len(payload))
+	out := make([]byte, len(hdr)+len(payload)+2)
+	copy(out, hdr)
+	copy(out[len(hdr):], payload)
+	copy(out[len(hdr)+len(payload):], "\r\n")
+	_, err := w.Write(out)
+	return err
 }

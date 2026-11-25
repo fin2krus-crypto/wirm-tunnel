@@ -752,8 +752,6 @@ func (sm *StatsManager) StartControlSocket(vpnEngine *VPNEngine, onShutdown func
 	return nil
 }
 
-// --- Функции для работы CLI-меню с базой и сокетом ---
-
 func readPSKsFromEnv(envPath string) []string {
 	raw, err := os.ReadFile(envPath)
 	if err != nil {

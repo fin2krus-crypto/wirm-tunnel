@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Server v0.3.0 + Android + macOS + Linux GUI)
+name: Build WinRM VPN (Server v0.4.0 + Clients v0.2.0)
 
 on:
   push:
@@ -33,36 +33,42 @@ jobs:
         with:
           packages: "platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125"
 
-      - name: Build Static Rustls TLS Front-End (musl x86_64)
+      - name: Compile eBPF SYN,ACK TCP Fingerprint Object
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev musl-tools
+          mkdir -p cmd/server/embedded
+          clang -O2 -g -target bpf -I/usr/include/x86_64-linux-gnu -c cmd/server/ebpf/synack_win.c -o cmd/server/embedded/synack_win.o
+
+      - name: Build Static OpenSSL 3 TLS Front-End (musl x86_64)
         working-directory: tls-front
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
+          sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+          sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
           rustup target add x86_64-unknown-linux-musl
           cargo build --release --target x86_64-unknown-linux-musl
-          mkdir -p ../cmd/server/embedded
-          cp target/x86_64-unknown-linux-musl/release/winrm-tls-rustls ../cmd/server/embedded/winrm-tls-rustls
+          cp target/x86_64-unknown-linux-musl/release/winrm-tls-front ../cmd/server/embedded/winrm-tls-front
 
       - name: Tidy Go dependencies
         run: |
           go mod tidy
 
-      - name: Build All-in-One Linux x86_64 Server Binary (v0.3.0)
+      - name: Build All-in-One Linux x86_64 Server Binary (v0.4.0)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/winrm-vpn-server ./cmd/server
 
-      - name: Smoke-test Binary (WinRM, ChaCha20 Rejection & Web Panel :49777)
+      - name: Smoke-test Binary (WinRM, TLS1.2 CBC, ChaCha20 Rejection & Web Panel)
         run: |
           ./dist/winrm-vpn-server -listen 0.0.0.0:5986 -psk "test-secret-key" &
           SRV_PID=$!
           sleep 2
-          RESP=$(curl -sk --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman \
+          curl -sk --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman \
             -H "Content-Type: application/soap+xml;charset=UTF-8" \
-            -d '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"><s:Header/><s:Body><wsmid:Identify/></s:Body></s:Envelope>')
-          echo "$RESP" | grep -q "Microsoft Corporation"
-          HDRS=$(curl -ski --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST https://127.0.0.1:5986/wsman -d '')
+            -d '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"><s:Header/><s:Body><wsmid:Identify/></s:Body></s:Envelope>' | grep -q "Microsoft Corporation"
+          HDRS=$(curl -ski --tlsv1.2 --tls-max 1.2 --ciphers ECDHE-RSA-AES256-SHA384 -X POST https://127.0.0.1:5986/wsman -d '')
           echo "$HDRS" | grep -q "Microsoft-HTTPAPI/2.0"
           echo "$HDRS" | grep -q "WWW-Authenticate: NTLM"
           if curl -sk --tlsv1.3 --tls13-ciphers TLS_CHACHA20_POLY1305_SHA256 https://127.0.0.1:5986/wsman >/dev/null 2>&1; then
@@ -70,8 +76,8 @@ jobs:
             kill $SRV_PID
             exit 1
           fi
-          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.3.0"'
-          echo "OK: Server v0.3.0 passed WinRM, ChaCha20 & Web Panel checks!"
+          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.4.0"'
+          echo "OK: Server v0.4.0 passed OpenSSL3 CBC, ChaCha20 Rejection & Web Panel checks!"
           kill $SRV_PID
 
       - name: Build Android Native Core (.aar) via Gomobile
@@ -112,8 +118,7 @@ jobs:
 
       - name: Install Fyne X11/OpenGL build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+          sudo apt-get update && sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
 
       - name: Build Static Linux Helper & Embed into GUI Binary
         run: |
@@ -188,11 +193,11 @@ jobs:
           path: release_files
           merge-multiple: true
 
-      - name: Publish all binaries to GitHub Release v0.3.0
+      - name: Publish all binaries to GitHub Release v0.4.0
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.3.0
-          name: WinRM-VPN v0.3.0 (Server v0.3.0 / Clients v0.1.1)
+          tag_name: v0.4.0
+          name: WinRM-VPN (Server v0.4.0 / Clients v0.2.0)
           files: |
             release_files/winrm-vpn-server
             release_files/winrm-vpn-client.apk

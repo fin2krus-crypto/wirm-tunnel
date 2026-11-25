@@ -15,13 +15,11 @@ class WinRmVpnTileService : TileService() {
 
     override fun onStartListening() {
         super.onStartListening()
-        // Подписываемся на обновления статуса, пока шторка открыта
         VpnStateBus.stateListeners.add(stateListener)
         updateTileState(VpnStateBus.currentState)
     }
 
     override fun onStopListening() {
-        // Отписываемся, когда шторка закрывается
         VpnStateBus.stateListeners.remove(stateListener)
         super.onStopListening()
     }
@@ -63,27 +61,22 @@ class WinRmVpnTileService : TileService() {
         val state = VpnStateBus.currentState
 
         if (state == "CONNECTED" || state == "CONNECTING") {
-            // Выключаем VPN
             val i = Intent(this, WinRmVpnService::class.java).apply { action = "STOP" }
             startService(i)
         } else {
-            // Включаем VPN
             val prefs = getSharedPreferences("winrm_cfg", Context.MODE_PRIVATE)
             val server = prefs.getString("server", "") ?: ""
             val psk = prefs.getString("psk", "") ?: ""
 
-            // Если настройки пустые — открываем само приложение
             if (server.isEmpty() || psk.isEmpty()) {
                 launchApp()
                 return
             }
 
-            // Если Android требует ручного подтверждения разрешения на VPN — открываем приложение
             val prepareIntent = VpnService.prepare(this)
             if (prepareIntent != null) {
                 launchApp()
             } else {
-                // Если разрешение уже есть, запускаем VPN-туннель напрямую
                 val pin = prefs.getString("pin", "") ?: ""
                 val svc = Intent(this, WinRmVpnService::class.java).apply {
                     putExtra("server", server)

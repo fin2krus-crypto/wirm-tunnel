@@ -18,13 +18,10 @@ import android.os.ParcelFileDescriptor
 import mobile.Mobile
 import mobile.SocketProtector
 import mobile.TunnelCallback
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.random.Random
 
 object VpnStateBus {
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -62,7 +59,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
 
     @Volatile private var isStopping = false
 
-    // Страховочный таймер на все 3 попытки (45 сек)
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var isConnectTimeoutArmed = false
     private val connectTimeoutRunnable = Runnable {
@@ -71,10 +67,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
             stopVpn(dueToError = true)
         }
     }
-
-    // Поток периодической проверки соединения (ping 1.1.1.1)
-    @Volatile private var healthCheckRunning = false
-    private var healthCheckThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
@@ -88,12 +80,13 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         val certPin = intent.getStringExtra("pin") ?: ""
 
         val prefs = getSharedPreferences("winrm_cfg", Context.MODE_PRIVATE)
-        VpnStateBus.checkConnectionEnabled = prefs.getBoolean("check_conn", false)
+        val watchEnabled = prefs.getBoolean("check_conn", false)
+        VpnStateBus.checkConnectionEnabled = watchEnabled
+        Mobile.setCheckConnection(watchEnabled)
 
         isStopping = false
         startForegroundNotification()
         setupNetworkMonitor()
-        startHealthCheckLoop()
         armConnectTimeoutIfNeeded()
 
         VpnStateBus.log("[ANDROID] Подключение к серверу (TUN поднимется только после успеха)...")
@@ -111,7 +104,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         return START_STICKY
     }
 
-    // Вызывается из Go только ПОСЛЕ успешной авторизации (200 OK)
     @Synchronized
     override fun openTun(): Long {
         if (isStopping) return -1L
@@ -154,85 +146,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
     }
 
-    private fun startHealthCheckLoop() {
-        if (healthCheckRunning) return
-        healthCheckRunning = true
-        healthCheckThread = Thread {
-            while (healthCheckRunning) {
-                if (!VpnStateBus.checkConnectionEnabled || VpnStateBus.currentState != "CONNECTED") {
-                    try {
-                        Thread.sleep(1000L)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                    continue
-                }
-
-                // 1. Случайный интервал 30–60 секунд
-                val waitSec = Random.nextInt(30, 61)
-                if (!interruptibleSleepSec(waitSec)) continue
-
-                if (pingTarget("1.1.1.1")) {
-                    VpnStateBus.log("[WATCHDOG] ping 1.1.1.1 OK (след. через 30-60с)")
-                    continue
-                }
-
-                // 2. Первая неудача -> повтор через случайные 10–20 секунд
-                val retrySec = Random.nextInt(10, 21)
-                VpnStateBus.log("[WATCHDOG] ping 1.1.1.1 не прошёл! Повтор через ${retrySec}с...")
-                if (!interruptibleSleepSec(retrySec)) continue
-
-                if (pingTarget("1.1.1.1")) {
-                    VpnStateBus.log("[WATCHDOG] Повторный ping 1.1.1.1 OK")
-                } else {
-                    // 3. Повторная неудача -> перезапуск VPN соединения
-                    VpnStateBus.log("[WATCHDOG] Повторный ping 1.1.1.1 не прошёл! Перезапуск VPN...")
-                    Mobile.triggerReconnect()
-                    try {
-                        Thread.sleep(2000L)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                }
-            }
-        }.apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun stopHealthCheckLoop() {
-        healthCheckRunning = false
-        healthCheckThread?.interrupt()
-        healthCheckThread = null
-    }
-
-    private fun interruptibleSleepSec(seconds: Int): Boolean {
-        for (i in 0 until seconds) {
-            if (!healthCheckRunning || !VpnStateBus.checkConnectionEnabled || VpnStateBus.currentState != "CONNECTED") {
-                return false
-            }
-            try {
-                Thread.sleep(1000L)
-            } catch (_: InterruptedException) {
-                return false
-            }
-        }
-        return healthCheckRunning && VpnStateBus.checkConnectionEnabled && VpnStateBus.currentState == "CONNECTED"
-    }
-
-    private fun pingTarget(host: String): Boolean {
-        return try {
-            val proc = ProcessBuilder("/system/bin/ping", "-c", "1", "-W", "3", host)
-                .redirectErrorStream(true)
-                .start()
-            BufferedReader(InputStreamReader(proc.inputStream)).use { it.readText() }
-            proc.waitFor() == 0
-        } catch (_: Exception) {
-            false
-        }
-    }
-
     private fun setupNetworkMonitor() {
         if (networkCallback != null) return
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -246,7 +159,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (lastNetwork == null) {
-                    // Первичная фиксация текущей сети без лишнего сброса соединения
                     lastNetwork = network
                     VpnStateBus.log("[NETWORK] Active network detected ($network).")
                 } else if (lastNetwork != network) {
@@ -308,7 +220,6 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         if (isStopping) return
         isStopping = true
         cancelConnectTimeout()
-        stopHealthCheckLoop()
         stopNetworkMonitor()
         Mobile.stopWinRMTunnel()
         try {
@@ -335,14 +246,14 @@ class WinRmVpnService : VpnService(), SocketProtector, TunnelCallback {
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("WinRM-VPN v0.1.1")
+                .setContentTitle("WinRM-VPN v0.2.0")
                 .setContentText("Should looks like Ansible")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("WinRM-VPN v0.1.1")
+                .setContentTitle("WinRM-VPN v0.2.0")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .build()
         }

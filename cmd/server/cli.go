@@ -206,7 +206,6 @@ func menuAddUser(scanner *bufio.Scanner, dataDir string) {
 				if pin := readCertPin(dataDir); pin != "" {
 					fmt.Printf("  Cert SHA-256   : %s\n", pin)
 				}
-				fmt.Println("  (Если сервер запущен — ключ применён автоматически без перезапуска)")
 			}
 			waitForZero(scanner)
 			return
@@ -244,7 +243,6 @@ func menuDeleteUser(scanner *bufio.Scanner, dataDir string) {
 			waitForZero(scanner)
 			return
 		}
-
 		for i, u := range snap.Users {
 			st := "оффлайн"
 			if u.Online {
@@ -266,7 +264,6 @@ func menuDeleteUser(scanner *bufio.Scanner, dataDir string) {
 			fmt.Println("[!] Некорректный номер.")
 			continue
 		}
-
 		target := snap.Users[idx-1].PSK
 		fmt.Printf("\nУдалить пользователя %s? (1 - Да, 0 - Назад): ", target)
 		if !scanner.Scan() {
@@ -280,7 +277,7 @@ func menuDeleteUser(scanner *bufio.Scanner, dataDir string) {
 			if err := deleteUserFromStorage(dataDir, target); err != nil {
 				fmt.Printf("[ОШИБКА] %v\n", err)
 			} else {
-				fmt.Println("[OK] Пользователь удалён (активные сессии этого ключа закрыты).")
+				fmt.Println("[OK] Пользователь удалён.")
 			}
 			waitForZero(scanner)
 			return
@@ -312,32 +309,23 @@ func menuUpdateServer(scanner *bufio.Scanner) {
 			if token == "0" {
 				continue
 			}
-
 			url := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/update.sh", defaultGitHubRepo)
-			fmt.Printf("\n[*] Загрузка и запуск %s...\n", url)
-
 			var cmd *exec.Cmd
 			if token != "" {
-				scriptCmd := fmt.Sprintf(`curl -fsSL -H "Authorization: Bearer %s" %s | GITHUB_TOKEN="%s" bash`,
-					token, url, token)
-				cmd = exec.Command("bash", "-c", scriptCmd)
+				cmd = exec.Command("bash", "-c", fmt.Sprintf(`curl -fsSL -H "Authorization: Bearer %s" %s | GITHUB_TOKEN="%s" bash`, token, url, token))
 			} else {
-				scriptCmd := fmt.Sprintf(`curl -fsSL %s | bash`, url)
-				cmd = exec.Command("bash", "-c", scriptCmd)
+				cmd = exec.Command("bash", "-c", fmt.Sprintf(`curl -fsSL %s | bash`, url))
 			}
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			cmd.Stdin = os.Stdin
-
 			if err := cmd.Run(); err != nil {
-				fmt.Printf("\n[ОШИБКА] Обновление завершилось с ошибкой: %v\n", err)
+				fmt.Printf("\n[ОШИБКА] %v\n", err)
 			} else {
-				fmt.Println("\n[OK] Обновление выполнено. Для работы с новой версией CLI перезапустите winrm-vpn-server.")
+				fmt.Println("\n[OK] Обновление выполнено.")
 			}
 			waitForZero(scanner)
 			return
-		default:
-			fmt.Println("Неверный выбор.")
 		}
 	}
 }
@@ -360,20 +348,12 @@ func menuStartServer(scanner *bufio.Scanner, dataDir string) {
 	}
 
 	if hasSystemdService() {
-		fmt.Println("[*] Запуск службы systemd (winrm-vpn)...")
 		out, err := exec.Command("systemctl", "start", "winrm-vpn").CombinedOutput()
 		if err != nil {
-			fmt.Printf("[ОШИБКА] Не удалось запустить systemd-службу: %v\n%s\n", err, string(out))
+			fmt.Printf("[ОШИБКА] %v\n%s\n", err, string(out))
 		} else {
 			time.Sleep(1500 * time.Millisecond)
-			if isSystemdActive() {
-				fmt.Println("[OK] Служба winrm-vpn успешно запущена!")
-				if pin := readCertPin(dataDir); pin != "" {
-					fmt.Printf("  Cert SHA-256 Pin: %s\n", pin)
-				}
-			} else {
-				fmt.Println("[ОШИБКА] Служба остановилась после запуска. Проверьте: journalctl -u winrm-vpn -n 20")
-			}
+			fmt.Println("[OK] Служба winrm-vpn запущена!")
 		}
 		waitForZero(scanner)
 		return
@@ -383,7 +363,7 @@ func menuStartServer(scanner *bufio.Scanner, dataDir string) {
 	if len(snap.Users) == 0 {
 		psk := generateRandomPSK()
 		if err := addUserToStorage(dataDir, psk); err != nil {
-			fmt.Printf("[ОШИБКА] Не удалось создать ключ пользователя: %v\n", err)
+			fmt.Printf("[ОШИБКА] %v\n", err)
 			waitForZero(scanner)
 			return
 		}
@@ -392,62 +372,43 @@ func menuStartServer(scanner *bufio.Scanner, dataDir string) {
 
 	exePath, err := os.Executable()
 	if err != nil {
-		fmt.Printf("[ОШИБКА] Не удалось определить путь к бинарнику: %v\n", err)
 		waitForZero(scanner)
 		return
 	}
-
 	logPath := filepath.Join(dataDir, "server.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		fmt.Printf("[ОШИБКА] Не удалось открыть лог-файл %s: %v\n", logPath, err)
 		waitForZero(scanner)
 		return
 	}
-
 	cmd := exec.Command(exePath, "-daemon", "-data-dir", dataDir, "-listen", "0.0.0.0:5986")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
-		fmt.Printf("[ОШИБКА] Ошибка запуска фона: %v\n", err)
+		fmt.Printf("[ОШИБКА] %v\n", err)
 		waitForZero(scanner)
 		return
 	}
 	_ = cmd.Process.Release()
 	_ = logFile.Close()
-
 	time.Sleep(1500 * time.Millisecond)
-	if _, err := fetchLiveStats(dataDir); err == nil {
-		fmt.Printf("[OK] Сервер запущен в фоне! Логи: %s\n", logPath)
-		if pin := readCertPin(dataDir); pin != "" {
-			fmt.Printf("  Cert SHA-256 Pin: %s\n", pin)
-		}
-	} else {
-		fmt.Printf("[!] Команда запуска выполнена, проверьте логи: %s\n", logPath)
-	}
+	fmt.Printf("[OK] Сервер запущен в фоне. Логи: %s\n", logPath)
 	waitForZero(scanner)
 }
 
 func menuStopServer(scanner *bufio.Scanner, dataDir string) {
 	fmt.Println("\n==================== ОСТАНОВКА СЕРВЕРА =========================")
-	stoppedSomething := false
-
+	stopped := false
 	if isSystemdActive() {
-		fmt.Println("[*] Остановка systemd-службы winrm-vpn...")
-		if out, err := exec.Command("systemctl", "stop", "winrm-vpn").CombinedOutput(); err != nil {
-			fmt.Printf("[ОШИБКА] systemctl stop: %v\n%s\n", err, string(out))
-		} else {
-			stoppedSomething = true
+		if exec.Command("systemctl", "stop", "winrm-vpn").Run() == nil {
+			stopped = true
 		}
 	}
-
-	if err := sendControlCommand(dataDir, "/stop"); err == nil {
-		stoppedSomething = true
-		time.Sleep(500 * time.Millisecond)
+	if sendControlCommand(dataDir, "/stop") == nil {
+		stopped = true
 	}
-
-	if stoppedSomething {
+	if stopped {
 		fmt.Println("[OK] Сервер остановлен.")
 	} else {
 		fmt.Println("[!] Сервер не был запущен.")
@@ -458,9 +419,8 @@ func menuStopServer(scanner *bufio.Scanner, dataDir string) {
 func menuUninstallServer(scanner *bufio.Scanner, dataDir string) bool {
 	for {
 		fmt.Println("\n==================== УДАЛЕНИЕ СЕРВЕРА ==========================")
-		fmt.Println("  Вы действительно хотите удалить WinRM-VPN Server?")
 		fmt.Println("  1. Удалить сервер и СОХРАНИТЬ данные пользователей")
-		fmt.Println("  2. Удалить сервер и УДАЛИТЬ ВСЕ данные (пользователи, PSK, сертификаты)")
+		fmt.Println("  2. Удалить сервер и УДАЛИТЬ ВСЕ данные")
 		fmt.Println("  0. Назад в главное меню")
 		fmt.Print("Ваш выбор: ")
 		if !scanner.Scan() {
@@ -471,49 +431,27 @@ func menuUninstallServer(scanner *bufio.Scanner, dataDir string) bool {
 			return false
 		}
 		if choice != "1" && choice != "2" {
-			fmt.Println("Неверный выбор.")
 			continue
 		}
-
 		keepUsers := (choice == "1")
-
-		fmt.Println("\n[*] Остановка и удаление службы...")
 		if hasSystemdService() {
 			_ = exec.Command("systemctl", "stop", "winrm-vpn").Run()
 			_ = exec.Command("systemctl", "disable", "winrm-vpn").Run()
 			_ = os.Remove("/etc/systemd/system/winrm-vpn.service")
 			_ = exec.Command("systemctl", "daemon-reload").Run()
-			fmt.Println("  - Служба systemd удалена.")
 		}
 		_ = sendControlCommand(dataDir, "/stop")
 		time.Sleep(300 * time.Millisecond)
-
 		_ = os.Remove("/etc/sysctl.d/99-winrm-vpn.conf")
 		_ = os.Remove(filepath.Join(dataDir, "control.sock"))
-
-		if keepUsers {
-			fmt.Printf("  - Данные пользователей сохранены в: %s\n", dataDir)
-		} else {
-			_ = os.Remove(filepath.Join(dataDir, "users.json"))
-			_ = os.Remove(filepath.Join(dataDir, "panel.json"))
-			_ = os.Remove(filepath.Join(dataDir, "config.env"))
-			_ = os.Remove(filepath.Join(dataDir, "winrm_cert.pem"))
-			_ = os.Remove(filepath.Join(dataDir, "winrm_key.pem"))
-			_ = os.Remove(filepath.Join(dataDir, "server.log"))
-			if dataDir == "/etc/winrm-vpn" {
-				_ = os.RemoveAll("/etc/winrm-vpn")
-			}
-			fmt.Println("  - Все данные пользователей и сертификаты удалены.")
+		if !keepUsers {
+			_ = os.RemoveAll(dataDir)
 		}
-
 		if exePath, err := os.Executable(); err == nil {
-			if err := os.Remove(exePath); err == nil {
-				fmt.Printf("  - Бинарник %s удалён.\n", exePath)
-			}
+			_ = os.Remove(exePath)
 		}
 		_ = os.Remove("/usr/local/bin/winrm-vpn-server")
-
-		fmt.Println("\n[OK] Удаление завершено.")
+		fmt.Println("[OK] Удаление завершено.")
 		waitForZero(scanner)
 		return true
 	}
@@ -522,29 +460,24 @@ func menuUninstallServer(scanner *bufio.Scanner, dataDir string) bool {
 func menuSpeedtest(scanner *bufio.Scanner) {
 	for {
 		fmt.Println("\n================ ПРОВЕРКА СКОРОСТИ (SPEEDTEST.NET) =============")
-		fmt.Println("  1. Запустить тест скорости (авто: Ookla CLI или встроенный тест)")
+		fmt.Println("  1. Запустить тест скорости (авто)")
 		fmt.Println("  2. Установить и запустить официальный Ookla Speedtest CLI")
 		fmt.Println("  0. Назад в главное меню")
 		fmt.Print("Ваш выбор: ")
 		if !scanner.Scan() {
 			return
 		}
-		choice := strings.TrimSpace(scanner.Text())
-		switch choice {
+		switch strings.TrimSpace(scanner.Text()) {
 		case "0":
 			return
 		case "1":
 			if bin, err := exec.LookPath("speedtest"); err == nil {
-				fmt.Printf("\n[*] Запуск %s...\n\n", bin)
 				c := exec.Command(bin, "--accept-license", "--accept-gdpr")
-				c.Stdout = os.Stdout
-				c.Stderr = os.Stderr
+				c.Stdout, c.Stderr = os.Stdout, os.Stderr
 				_ = c.Run()
 			} else if bin, err := exec.LookPath("speedtest-cli"); err == nil {
-				fmt.Printf("\n[*] Запуск %s...\n\n", bin)
 				c := exec.Command(bin)
-				c.Stdout = os.Stdout
-				c.Stderr = os.Stderr
+				c.Stdout, c.Stderr = os.Stdout, os.Stderr
 				_ = c.Run()
 			} else {
 				runNativeSpeedtest()
@@ -555,32 +488,21 @@ func menuSpeedtest(scanner *bufio.Scanner) {
 			installAndRunOoklaCLI()
 			waitForZero(scanner)
 			return
-		default:
-			fmt.Println("Неверный выбор.")
 		}
 	}
 }
 
 func installAndRunOoklaCLI() {
-	fmt.Println("\n[*] Скачивание официального Ookla Speedtest CLI (x86_64)...")
 	url := "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
-	cmd := exec.Command("bash", "-c", fmt.Sprintf(
-		`TMP=$(mktemp -d) && curl -fsSL "%s" -o "$TMP/st.tgz" && tar -xzf "$TMP/st.tgz" -C "$TMP" && mv "$TMP/speedtest" /usr/local/bin/speedtest && chmod 755 /usr/local/bin/speedtest && rm -rf "$TMP"`,
-		url,
-	))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("[ОШИБКА] Не удалось установить Ookla CLI: %v\n", err)
-		fmt.Println("[*] Выполняется встроенный тест Speedtest.net...")
+	cmd := exec.Command("bash", "-c", fmt.Sprintf(`TMP=$(mktemp -d) && curl -fsSL "%s" -o "$TMP/st.tgz" && tar -xzf "$TMP/st.tgz" -C "$TMP" && mv "$TMP/speedtest" /usr/local/bin/speedtest && chmod 755 /usr/local/bin/speedtest && rm -rf "$TMP"`, url))
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if cmd.Run() != nil {
 		runNativeSpeedtest()
 		return
 	}
-	fmt.Println("[OK] Ookla CLI установлен в /usr/local/bin/speedtest. Запуск теста...\n")
-	runCmd := exec.Command("/usr/local/bin/speedtest", "--accept-license", "--accept-gdpr")
-	runCmd.Stdout = os.Stdout
-	runCmd.Stderr = os.Stderr
-	_ = runCmd.Run()
+	c := exec.Command("/usr/local/bin/speedtest", "--accept-license", "--accept-gdpr")
+	c.Stdout, c.Stderr = os.Stdout, os.Stderr
+	_ = c.Run()
 }
 
 type speedtestServer struct {
@@ -592,174 +514,132 @@ type speedtestServer struct {
 }
 
 func runNativeSpeedtest() {
-	fmt.Println("\n[*] Поиск ближайших серверов Speedtest.net...")
 	client := &http.Client{Timeout: 8 * time.Second}
 	req, _ := http.NewRequest("GET", "https://www.speedtest.net/api/js/servers?engine=js&limit=8", nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("[ОШИБКА] Не удалось получить список серверов speedtest.net: %v\n", err)
+		fmt.Printf("[ОШИБКА] %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
-
 	var servers []speedtestServer
-	if err := json.NewDecoder(resp.Body).Decode(&servers); err != nil || len(servers) == 0 {
-		fmt.Println("[ОШИБКА] Не удалось разобрать список серверов speedtest.net.")
+	if json.NewDecoder(resp.Body).Decode(&servers) != nil || len(servers) == 0 {
 		return
 	}
-
-	var best speedtestServer
+	best := servers[0]
 	bestRTT := time.Hour
-	for _, srv := range servers {
-		rtt := measureTCPPing(srv.Host)
-		if rtt > 0 && rtt < bestRTT {
-			bestRTT = rtt
-			best = srv
+	for _, s := range servers {
+		if rtt := measureTCPPing(s.Host); rtt > 0 && rtt < bestRTT {
+			bestRTT, best = rtt, s
 		}
 	}
-	if best.URL == "" {
-		best = servers[0]
-		bestRTT = measureTCPPing(best.Host)
-	}
-
-	fmt.Printf("  Сервер   : %s (%s, %s)\n", best.Sponsor, best.Name, best.Country)
-	if bestRTT > 0 && bestRTT < time.Hour {
-		fmt.Printf("  Пинг     : %.2f ms\n", float64(bestRTT.Microseconds())/1000.0)
-	}
-
-	fmt.Print("  Скачивание (Download)... ")
-	dlMbps := measureSpeedtestDownload(best)
-	fmt.Printf("%.2f Mbps\n", dlMbps)
-
-	fmt.Print("  Отдача (Upload)...       ")
-	ulMbps := measureSpeedtestUpload(best)
-	fmt.Printf("%.2f Mbps\n", ulMbps)
+	fmt.Printf("  Сервер: %s (%s, %s)\n  Пинг  : %.2f ms\n", best.Sponsor, best.Name, best.Country, float64(bestRTT.Microseconds())/1000.0)
+	fmt.Printf("  Down  : %.2f Mbps\n", measureSpeedtestDownload(best))
+	fmt.Printf("  Up    : %.2f Mbps\n", measureSpeedtestUpload(best))
 }
 
-func measureTCPPing(hostPort string) time.Duration {
-	if !strings.Contains(hostPort, ":") {
-		hostPort += ":8080"
+func measureTCPPing(hp string) time.Duration {
+	if !strings.Contains(hp, ":") {
+		hp += ":8080"
 	}
-	best := time.Duration(0)
+	var best time.Duration
 	for i := 0; i < 3; i++ {
-		start := time.Now()
-		c, err := net.DialTimeout("tcp", hostPort, 2*time.Second)
-		if err != nil {
-			continue
-		}
-		d := time.Since(start)
-		_ = c.Close()
-		if best == 0 || d < best {
-			best = d
+		st := time.Now()
+		c, err := net.DialTimeout("tcp", hp, 2*time.Second)
+		if err == nil {
+			d := time.Since(st)
+			_ = c.Close()
+			if best == 0 || d < best {
+				best = d
+			}
 		}
 	}
 	return best
 }
 
 func measureSpeedtestDownload(srv speedtestServer) float64 {
-	baseURL := strings.TrimSuffix(srv.URL, "upload.php")
-	candidates := []string{
-		baseURL + "random4000x4000.jpg",
-		baseURL + "random2500x2500.jpg",
-		"https://" + srv.Host + "/download?size=25000000",
-		"http://" + srv.Host + "/download?size=25000000",
-	}
-
-	var workingURL string
-	probeClient := &http.Client{Timeout: 4 * time.Second}
-	for _, u := range candidates {
-		req, _ := http.NewRequest("GET", u, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-		resp, err := probeClient.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == 200 {
-				workingURL = u
+	base := strings.TrimSuffix(srv.URL, "upload.php")
+	cands := []string{base + "random4000x4000.jpg", base + "random2500x2500.jpg", "https://" + srv.Host + "/download?size=25000000", "http://" + srv.Host + "/download?size=25000000"}
+	var u string
+	pc := &http.Client{Timeout: 4 * time.Second}
+	for _, cand := range cands {
+		rq, _ := http.NewRequest("GET", cand, nil)
+		rq.Header.Set("User-Agent", "Mozilla/5.0")
+		if rs, err := pc.Do(rq); err == nil {
+			_ = rs.Body.Close()
+			if rs.StatusCode == 200 {
+				u = cand
 				break
 			}
 		}
 	}
-	if workingURL == "" {
+	if u == "" {
 		return 0
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-
-	var totalBytes int64
+	var total int64
 	var wg sync.WaitGroup
-	start := time.Now()
-
+	st := time.Now()
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dlClient := &http.Client{Timeout: 7 * time.Second}
+			dc := &http.Client{Timeout: 7 * time.Second}
 			buf := make([]byte, 32*1024)
 			for ctx.Err() == nil {
-				req, _ := http.NewRequestWithContext(ctx, "GET", workingURL, nil)
-				req.Header.Set("User-Agent", "Mozilla/5.0")
-				resp, err := dlClient.Do(req)
+				rq, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+				rq.Header.Set("User-Agent", "Mozilla/5.0")
+				rs, err := dc.Do(rq)
 				if err != nil {
 					return
 				}
 				for {
-					n, err := resp.Body.Read(buf)
+					n, er := rs.Body.Read(buf)
 					if n > 0 {
-						atomic.AddInt64(&totalBytes, int64(n))
+						atomic.AddInt64(&total, int64(n))
 					}
-					if err != nil {
+					if er != nil {
 						break
 					}
 				}
-				_ = resp.Body.Close()
+				_ = rs.Body.Close()
 			}
 		}()
 	}
 	wg.Wait()
-	elapsed := time.Since(start).Seconds()
-	if elapsed <= 0 {
-		return 0
-	}
-	return float64(atomic.LoadInt64(&totalBytes)*8) / elapsed / 1_000_000.0
+	return float64(atomic.LoadInt64(&total)*8) / time.Since(st).Seconds() / 1e6
 }
 
 func measureSpeedtestUpload(srv speedtestServer) float64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	payload := bytes.Repeat([]byte("0123456789ABCDEF"), 64*1024)
-	var totalBytes int64
+	var total int64
 	var wg sync.WaitGroup
-	start := time.Now()
-
+	st := time.Now()
 	for w := 0; w < 3; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ulClient := &http.Client{Timeout: 6 * time.Second}
+			uc := &http.Client{Timeout: 6 * time.Second}
 			for ctx.Err() == nil {
-				cr := &countingReader{r: bytes.NewReader(payload), counter: &totalBytes}
-				req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL, cr)
-				req.Header.Set("User-Agent", "Mozilla/5.0")
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				resp, err := ulClient.Do(req)
+				cr := &countingReader{r: bytes.NewReader(payload), counter: &total}
+				rq, _ := http.NewRequestWithContext(ctx, "POST", srv.URL, cr)
+				rq.Header.Set("User-Agent", "Mozilla/5.0")
+				rq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				rs, err := uc.Do(rq)
 				if err != nil {
 					return
 				}
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
+				_, _ = io.Copy(io.Discard, rs.Body)
+				_ = rs.Body.Close()
 			}
 		}()
 	}
 	wg.Wait()
-	elapsed := time.Since(start).Seconds()
-	if elapsed <= 0 {
-		return 0
-	}
-	return float64(atomic.LoadInt64(&totalBytes)*8) / elapsed / 1_000_000.0
+	return float64(atomic.LoadInt64(&total)*8) / time.Since(st).Seconds() / 1e6
 }
 
 type countingReader struct {
@@ -782,19 +662,12 @@ func generateRandomPSK() string {
 }
 
 func readCertPin(dataDir string) string {
-	candidates := []string{
-		filepath.Join(dataDir, "winrm_cert.pem"),
-		"winrm_cert.pem",
-	}
-	for _, p := range candidates {
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		block, _ := pem.Decode(raw)
-		if block != nil {
-			h := sha256.Sum256(block.Bytes)
-			return hex.EncodeToString(h[:])
+	for _, p := range []string{filepath.Join(dataDir, "winrm_cert.pem"), "winrm_cert.pem"} {
+		if raw, err := os.ReadFile(p); err == nil {
+			if block, _ := pem.Decode(raw); block != nil {
+				h := sha256.Sum256(block.Bytes)
+				return hex.EncodeToString(h[:])
+			}
 		}
 	}
 	return ""
@@ -802,8 +675,7 @@ func readCertPin(dataDir string) string {
 
 func fetchExternalIP() string {
 	client := &http.Client{Timeout: 2 * time.Second}
-	urls := []string{"https://api.ipify.org", "https://ifconfig.io/ip"}
-	for _, u := range urls {
+	for _, u := range []string{"https://api.ipify.org", "https://ifconfig.io/ip"} {
 		req, _ := http.NewRequest("GET", u, nil)
 		req.Header.Set("User-Agent", "curl/8.5.0")
 		if resp, err := client.Do(req); err == nil {
@@ -824,8 +696,7 @@ func hasSystemdService() bool {
 }
 
 func isSystemdActive() bool {
-	err := exec.Command("systemctl", "is-active", "--quiet", "winrm-vpn").Run()
-	return err == nil
+	return exec.Command("systemctl", "is-active", "--quiet", "winrm-vpn").Run() == nil
 }
 
 func formatBytes(b uint64) string {
@@ -849,7 +720,6 @@ func formatDuration(d time.Duration) string {
 	sec %= 3600
 	mins := sec / 60
 	sec %= 60
-
 	if days > 0 {
 		return fmt.Sprintf("%dд %dч %dм %dс", days, hours, mins, sec)
 	}

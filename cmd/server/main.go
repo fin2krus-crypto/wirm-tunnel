@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -31,13 +32,13 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.3.0"
+const AppVersion = "0.4.0"
 
-//go:embed embedded/winrm-tls-rustls
-var embeddedRustlsBin []byte
+//go:embed embedded/winrm-tls-front
+var embeddedTlsFrontBin []byte
 
 func printQuickGuide() {
-	fmt.Printf(`WinRM-VPN Server v%s (All-in-One: Rustls + gVisor + Web-Panel :49777)
+	fmt.Printf(`WinRM-VPN Server v%s (OpenSSL 3 CBC+GCM + eBPF SYN,ACK + 2-Channel WinRM + Web-Panel)
 
 Короткая инструкция по запуску на Linux (x86_64):
   1. Откройте порты в фаерволе:
@@ -49,23 +50,173 @@ func printQuickGuide() {
 
   3. Или запустите сервер напрямую параметрами:
        winrm-vpn-server -listen 0.0.0.0:5986 -psk "ВАШ_КЛЮЧ_PSK"
-     (Несколько ключей можно указать через запятую: -psk "key1,key2")
 
-  4. Веб-панель управления доступна по адресу:
+  4. Веб-панель управления:
        http://<IP_СЕРВЕРА>:49777
-
-Параметры запуска:
-  -listen   string   Внешний адрес и порт VPN (по умолчанию "0.0.0.0:5986")
-  -web-port int      Принудительный порт веб-панели (по умолчанию из panel.json или 49777)
-  -psk      string   Ключ или список ключей через запятую
-  -daemon            Запуск с использованием пользователей из users.json (без -psk)
-  -data-dir string   Директория хранения users.json, panel.json, сокета и сертификата
-  -cert     string   Путь к TLS-сертификату (по умолчанию "winrm_cert.pem")
-  -key      string   Путь к приватному ключу (по умолчанию "winrm_key.pem")
 `, AppVersion)
 }
 
-// VPNEngine управляет жизненным циклом VPN-туннеля (порт 5986 + rustls) независимо от веб-панели
+// ClientSession связывает 2 WinRM-канала (Receive + Send) с одним изолированным gVisor-стеком
+type ClientSession struct {
+	id           [16]byte
+	psk          string
+	netstack     *ClientNetstack
+	txCh         chan []byte
+	keepAliveCh  chan struct{}
+	doneCh       chan struct{}
+	mu           sync.Mutex
+	lastActivity time.Time
+	recvActive   int
+	sendActive   int
+	closed       bool
+}
+
+func (s *ClientSession) Touch() {
+	s.mu.Lock()
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *ClientSession) AddRole(role byte, delta int) {
+	s.mu.Lock()
+	if role == common.RoleRecv {
+		s.recvActive += delta
+	} else {
+		s.sendActive += delta
+	}
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *ClientSession) Close() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	close(s.doneCh)
+	ns := s.netstack
+	s.mu.Unlock()
+	if ns != nil {
+		ns.Close()
+	}
+}
+
+type SessionManager struct {
+	mu       sync.Mutex
+	sessions map[[16]byte]*ClientSession
+	statsMgr *StatsManager
+	stopCh   chan struct{}
+}
+
+func NewSessionManager(statsMgr *StatsManager) *SessionManager {
+	sm := &SessionManager{
+		sessions: make(map[[16]byte]*ClientSession),
+		statsMgr: statsMgr,
+		stopCh:   make(chan struct{}),
+	}
+	go sm.reaperLoop()
+	return sm
+}
+
+func (sm *SessionManager) GetOrCreate(id [16]byte, psk string) (*ClientSession, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if s, ok := sm.sessions[id]; ok {
+		s.mu.Lock()
+		isClosed := s.closed
+		s.mu.Unlock()
+		if !isClosed {
+			s.Touch()
+			return s, nil
+		}
+	}
+
+	sess := &ClientSession{
+		id:           id,
+		psk:          psk,
+		txCh:         make(chan []byte, 256),
+		keepAliveCh:  make(chan struct{}, 8),
+		doneCh:       make(chan struct{}),
+		lastActivity: time.Now(),
+	}
+
+	ns, err := NewClientNetstack(func(pkt []byte) error {
+		// Копируем пакет, так как gVisor освобождает буфер сразу после возврата из onOut
+		cp := make([]byte, len(pkt))
+		copy(cp, pkt)
+
+		select {
+		case <-sess.doneCh:
+			return errors.New("session closed")
+		default:
+		}
+
+		select {
+		case sess.txCh <- cp:
+		default:
+			select {
+			case <-sess.txCh:
+			default:
+			}
+			select {
+			case sess.txCh <- cp:
+			default:
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sess.netstack = ns
+	sm.sessions[id] = sess
+	return sess, nil
+}
+
+func (sm *SessionManager) reaperLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sm.stopCh:
+			return
+		case <-ticker.C:
+			sm.mu.Lock()
+			var stale []*ClientSession
+			for id, s := range sm.sessions {
+				s.mu.Lock()
+				idle := s.recvActive == 0 && s.sendActive == 0 && time.Since(s.lastActivity) > 25*time.Second
+				s.mu.Unlock()
+				if idle {
+					stale = append(stale, s)
+					delete(sm.sessions, id)
+				}
+			}
+			sm.mu.Unlock()
+			for _, s := range stale {
+				s.Close()
+			}
+		}
+	}
+}
+
+func (sm *SessionManager) CloseAll() {
+	sm.mu.Lock()
+	var list []*ClientSession
+	for id, s := range sm.sessions {
+		list = append(list, s)
+		delete(sm.sessions, id)
+	}
+	sm.mu.Unlock()
+	for _, s := range list {
+		s.Close()
+	}
+}
+
 type VPNEngine struct {
 	mu         sync.Mutex
 	running    bool
@@ -76,9 +227,11 @@ type VPNEngine struct {
 	hostName   string
 	certPin    string
 	statsMgr   *StatsManager
+	sessMgr    *SessionManager
+	ebpfGuard  *EbpfGuard
 
 	backendLn net.Listener
-	rustlsCmd *exec.Cmd
+	frontCmd  *exec.Cmd
 	tmpPath   string
 }
 
@@ -88,6 +241,7 @@ func NewVPNEngine(listenAddr, certPath, keyPath string, statsMgr *StatsManager) 
 		certPath:   certPath,
 		keyPath:    keyPath,
 		statsMgr:   statsMgr,
+		sessMgr:    NewSessionManager(statsMgr),
 	}
 }
 
@@ -107,22 +261,26 @@ func (e *VPNEngine) Start() error {
 	e.hostName = hostName
 	e.statsMgr.SetMetadata(e.listenAddr, hostName, fingerprint, "", 0)
 
+	e.ebpfGuard = AttachWinTcpFingerprint(e.listenAddr)
+
 	backendLn, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
+		e.ebpfGuard.Detach()
 		e.mu.Unlock()
 		return fmt.Errorf("backend listen failed: %w", err)
 	}
 	backendAddr := backendLn.Addr().String()
 
-	rustlsCmd, tmpPath, err := startEmbeddedRustls(e.listenAddr, backendAddr, e.certPath, e.keyPath)
+	frontCmd, tmpPath, err := startEmbeddedTlsFront(e.listenAddr, backendAddr, e.certPath, e.keyPath)
 	if err != nil {
 		_ = backendLn.Close()
+		e.ebpfGuard.Detach()
 		e.mu.Unlock()
-		return fmt.Errorf("failed to start embedded rustls: %w", err)
+		return fmt.Errorf("failed to start OpenSSL3 frontend: %w", err)
 	}
 
 	e.backendLn = backendLn
-	e.rustlsCmd = rustlsCmd
+	e.frontCmd = frontCmd
 	e.tmpPath = tmpPath
 	e.stopReq = false
 	e.running = true
@@ -134,23 +292,24 @@ func (e *VPNEngine) Start() error {
 		_ = os.Remove(tmp)
 
 		e.mu.Lock()
-		wasExpected := e.stopReq || e.rustlsCmd != cmd
-		if e.rustlsCmd == cmd {
+		wasExpected := e.stopReq || e.frontCmd != cmd
+		if e.frontCmd == cmd {
 			e.running = false
-			e.rustlsCmd = nil
+			e.frontCmd = nil
 			e.tmpPath = ""
 			if e.backendLn != nil {
 				_ = e.backendLn.Close()
 				e.backendLn = nil
 			}
+			e.ebpfGuard.Detach()
 			e.statsMgr.SetVPNRunning(false)
 		}
 		e.mu.Unlock()
 
 		if !wasExpected {
-			log.Printf("[ERR] Embedded rustls frontend exited unexpectedly: %v", err)
+			log.Printf("[ERR] Embedded OpenSSL3 frontend exited unexpectedly: %v", err)
 		}
-	}(rustlsCmd, tmpPath)
+	}(frontCmd, tmpPath)
 
 	go func(ln net.Listener, hName string) {
 		for {
@@ -158,11 +317,11 @@ func (e *VPNEngine) Start() error {
 			if err != nil {
 				return
 			}
-			go handleWinRMConnection(conn, e.statsMgr, hName)
+			go handleWinRMConnection(conn, e.statsMgr, e.sessMgr, hName)
 		}
 	}(backendLn, hostName)
 
-	log.Printf("[VPN] Engine started on %s (Hostname: %s)", e.listenAddr, hostName)
+	log.Printf("[VPN] Engine started on %s (Hostname: %s, eBPF: %s)", e.listenAddr, hostName, ebpfStatusString(e.ebpfGuard))
 	return nil
 }
 
@@ -175,11 +334,13 @@ func (e *VPNEngine) Stop() {
 	e.stopReq = true
 	e.running = false
 	ln := e.backendLn
-	cmd := e.rustlsCmd
+	cmd := e.frontCmd
 	tmp := e.tmpPath
+	guard := e.ebpfGuard
 	e.backendLn = nil
-	e.rustlsCmd = nil
+	e.frontCmd = nil
 	e.tmpPath = ""
+	e.ebpfGuard = nil
 	e.mu.Unlock()
 
 	if ln != nil {
@@ -193,9 +354,13 @@ func (e *VPNEngine) Stop() {
 	if tmp != "" {
 		_ = os.Remove(tmp)
 	}
+	if guard != nil {
+		guard.Detach()
+	}
 
 	e.statsMgr.SetVPNRunning(false)
 	e.statsMgr.CloseAllActive()
+	e.sessMgr.CloseAll()
 	log.Printf("[VPN] Engine stopped (Web panel remains online)")
 }
 
@@ -218,7 +383,7 @@ func main() {
 	dataDirFlag := flag.String("data-dir", "", "Directory for users.json, panel.json and control.sock")
 	certFile := flag.String("cert", "winrm_cert.pem", "Path to TLS cert")
 	keyFile := flag.String("key", "winrm_key.pem", "Path to TLS key")
-	_ = flag.Bool("no-tun", false, "Deprecated (TUN is no longer required)")
+	_ = flag.Bool("no-tun", false, "Deprecated")
 	flag.Parse()
 
 	dataDir := resolveDataDir(*dataDirFlag)
@@ -292,7 +457,7 @@ func main() {
 	}
 	log.Printf("Emulated Hostname : %s", vpnEngine.hostName)
 	log.Printf("Loaded PSK keys   : %d (DataDir: %s)", len(statsMgr.GetAllPSKs()), dataDir)
-	log.Printf("Certificate SHA-256 Pin (copy to Android/macOS App):")
+	log.Printf("Certificate SHA-256 Pin (copy to Android/macOS/Linux App):")
 	log.Printf("%s", vpnEngine.certPin)
 	log.Printf("================================================================")
 
@@ -309,9 +474,9 @@ func resolveAssetPath(val, defaultName, dataDir string) string {
 	return filepath.Join(dataDir, val)
 }
 
-func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*exec.Cmd, string, error) {
-	if len(embeddedRustlsBin) == 0 {
-		return nil, "", errors.New("embedded rustls binary is empty")
+func startEmbeddedTlsFront(listenAddr, backendAddr, certPath, keyPath string) (*exec.Cmd, string, error) {
+	if len(embeddedTlsFrontBin) == 0 {
+		return nil, "", errors.New("embedded tls-front binary is empty")
 	}
 
 	tmpFile, err := os.CreateTemp("", "winrm-tls-*")
@@ -320,7 +485,7 @@ func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*ex
 	}
 	tmpPath := tmpFile.Name()
 
-	if _, err := tmpFile.Write(embeddedRustlsBin); err != nil {
+	if _, err := tmpFile.Write(embeddedTlsFrontBin); err != nil {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpPath)
 		return nil, "", err
@@ -349,13 +514,13 @@ func startEmbeddedRustls(listenAddr, backendAddr, certPath, keyPath string) (*ex
 	return cmd, tmpPath, nil
 }
 
-func verifyAnyPSK(b64Token string, pskList []string, challenge [8]byte) (string, bool) {
-	for _, psk := range pskList {
-		if common.VerifyNTLMType3Auth(b64Token, psk, challenge) {
-			return psk, true
+func verifyAnyPSKSession(b64Token string, pskList []string, challenge [8]byte) (psk string, sessionID [16]byte, role byte, ok bool) {
+	for _, k := range pskList {
+		if sid, r, valid := common.VerifyNTLMType3SessionAuth(b64Token, k, challenge); valid {
+			return k, sid, r, true
 		}
 	}
-	return "", false
+	return "", sessionID, 0, false
 }
 
 func isTimeoutOrClosed(err error) bool {
@@ -366,7 +531,7 @@ func isTimeoutOrClosed(err error) bool {
 	return errors.Is(err, net.ErrClosed)
 }
 
-func handleWinRMConnection(conn net.Conn, statsMgr *StatsManager, hostName string) {
+func handleWinRMConnection(conn net.Conn, statsMgr *StatsManager, sessMgr *SessionManager, hostName string) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(120 * time.Second))
 
@@ -433,43 +598,190 @@ func handleWinRMConnection(conn net.Conn, statsMgr *StatsManager, hostName strin
 		}
 
 		if hasChallenge && strings.HasPrefix(b64Token, "TlRMTVNTUAAD") {
-			if matchedPSK, ok := verifyAnyPSK(b64Token, statsMgr.GetAllPSKs(), currentChallenge); ok {
+			if matchedPSK, sessionID, role, ok := verifyAnyPSKSession(b64Token, statsMgr.GetAllPSKs(), currentChallenge); ok {
 				writeWinRM200StreamStart(conn, req.Host)
 				_ = conn.SetDeadline(time.Time{})
+
+				sess, err := sessMgr.GetOrCreate(sessionID, matchedPSK)
+				if err != nil {
+					return
+				}
 
 				connID := statsMgr.ClientConnected(matchedPSK, conn)
 				defer statsMgr.ClientDisconnected(matchedPSK, connID)
 
-				ns, err := NewClientNetstack(func(pkt []byte) error {
-					if err := common.WritePaddedFrame(conn, pkt); err != nil {
-						return err
-					}
-					statsMgr.AddTx(matchedPSK, len(pkt))
-					return nil
-				})
-				if err != nil {
-					log.Printf("Netstack init error: %v", err)
-					return
-				}
-				defer ns.Close()
+				sess.AddRole(role, 1)
+				defer sess.AddRole(role, -1)
 
-				log.Printf("[+] Client connected (key: %.8s...)", matchedPSK)
-				scratch := make([]byte, 65536)
-				for {
-					ipPkt, err := common.ReadPaddedFrame(br, scratch)
-					if err != nil {
-						break
-					}
-					statsMgr.AddRx(matchedPSK, len(ipPkt))
-					ns.InjectPacket(ipPkt)
+				if role == common.RoleRecv {
+					handleReceiveChannel(conn, br, sess, matchedPSK, statsMgr)
+				} else {
+					handleSendChannel(conn, br, sess, matchedPSK, statsMgr)
 				}
-				log.Printf("[-] Client disconnected (key: %.8s...)", matchedPSK)
 				return
 			}
 		}
 
 		writeWinRM401Final(conn, authScheme)
 		return
+	}
+}
+
+// handleReceiveChannel обслуживает канал скачивания (POST /wsman Receive -> 200 OK Transfer-Encoding: chunked)
+func handleReceiveChannel(conn net.Conn, br *bufio.Reader, sess *ClientSession, psk string, statsMgr *StatsManager) {
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+		_ = conn.SetReadDeadline(time.Time{})
+
+		if !strings.EqualFold(req.URL.Path, "/wsman") || req.Method != http.MethodPost {
+			writeHttpSys404(conn)
+			return
+		}
+
+		// Отправляем заголовок HTTP/1.1 Transfer-Encoding: chunked
+		hdr := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
+			"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+			"Server: %s\r\n"+
+			"Date: %s\r\n"+
+			"Transfer-Encoding: chunked\r\n\r\n",
+			common.ServerHeader, httpDate())
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.WriteString(conn, hdr); err != nil {
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
+
+		// Естественная ротация HTTP chunked ответа (как WinRM PT60S: 55..85 сек или 20 МБ)
+		rolloverDur := time.Duration(55+mathrand.Intn(31)) * time.Second
+		rolloverTimer := time.NewTimer(rolloverDur)
+		sentBytes := 0
+		const maxChunkedRespBytes = 20 * 1024 * 1024
+
+	streamLoop:
+		for {
+			select {
+			case <-sess.doneCh:
+				rolloverTimer.Stop()
+				_, _ = io.WriteString(conn, "0\r\n\r\n")
+				return
+
+			case <-rolloverTimer.C:
+				_, _ = io.WriteString(conn, "0\r\n\r\n")
+				break streamLoop
+
+			case <-sess.keepAliveCh:
+				frame := common.EncodeBatchFrame(nil, common.FrameKeepAlive)
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := common.WriteHTTPChunk(conn, frame); err != nil {
+					rolloverTimer.Stop()
+					return
+				}
+				_ = conn.SetWriteDeadline(time.Time{})
+				sess.Touch()
+
+			case firstPkt := <-sess.txCh:
+				pkts := make([][]byte, 1, 24)
+				pkts[0] = firstPkt
+				batchBytes := len(firstPkt)
+
+				// 3-мс коалесирующий батчер для заполнения полных MSS и устранения мелких PSH,ACK
+				coalesceTimer := time.NewTimer(3 * time.Millisecond)
+			drainLoop:
+				for len(pkts) < 24 && batchBytes < 32768 {
+					select {
+					case p := <-sess.txCh:
+						pkts = append(pkts, p)
+						batchBytes += len(p)
+					case <-coalesceTimer.C:
+						break drainLoop
+					}
+				}
+				if !coalesceTimer.Stop() {
+					select {
+					case <-coalesceTimer.C:
+					default:
+					}
+				}
+
+				frame := common.EncodeBatchFrame(pkts, common.FrameData)
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := common.WriteHTTPChunk(conn, frame); err != nil {
+					rolloverTimer.Stop()
+					return
+				}
+				_ = conn.SetWriteDeadline(time.Time{})
+
+				statsMgr.AddTx(psk, batchBytes)
+				sess.Touch()
+				sentBytes += len(frame)
+				if sentBytes >= maxChunkedRespBytes {
+					rolloverTimer.Stop()
+					_, _ = io.WriteString(conn, "0\r\n\r\n")
+					break streamLoop
+				}
+			}
+		}
+	}
+}
+
+// handleSendChannel обслуживает полудуплексный канал загрузки (POST /wsman -> 200 OK SendResponse)
+func handleSendChannel(conn net.Conn, br *bufio.Reader, sess *ClientSession, psk string, statsMgr *StatsManager) {
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(150 * time.Second))
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+
+		if !strings.EqualFold(req.URL.Path, "/wsman") || req.Method != http.MethodPost {
+			_, _ = io.Copy(io.Discard, req.Body)
+			_ = req.Body.Close()
+			writeHttpSys404(conn)
+			return
+		}
+
+		frameType, pkts, err := common.DecodeBatchFrame(req.Body)
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			writeHttpSys400(conn)
+			return
+		}
+
+		if frameType == common.FrameKeepAlive {
+			select {
+			case sess.keepAliveCh <- struct{}{}:
+			default:
+			}
+		} else {
+			for _, pkt := range pkts {
+				if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
+					statsMgr.AddRx(psk, len(pkt))
+					sess.netstack.InjectPacket(pkt)
+				}
+			}
+		}
+		sess.Touch()
+
+		soapResp := common.BuildSoapSendResponseXML(req.Host)
+		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
+			"Content-Type: application/soap+xml;charset=UTF-8\r\n"+
+			"Server: %s\r\n"+
+			"Date: %s\r\n"+
+			"Content-Length: %d\r\n\r\n%s",
+			common.ServerHeader, httpDate(), len(soapResp), soapResp)
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.WriteString(conn, resp); err != nil {
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
 	}
 }
 

@@ -35,7 +35,6 @@
             </intent-filter>
         </service>
 
-        <!-- Плитка для шторки быстрых настроек -->
         <service
             android:name=".WinRmVpnTileService"
             android:label="WinRM-VPN"

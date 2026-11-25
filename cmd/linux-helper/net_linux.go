@@ -23,7 +23,6 @@ func openLinuxTun() (*os.File, string, error) {
 
 	var ifr [40]byte
 	copy(ifr[:16], linuxTunName)
-	// IFF_TUN (0x0001) | IFF_NO_PI (0x1000) = 0x1001 (little-endian)
 	ifr[16] = 0x01
 	ifr[17] = 0x10
 
@@ -61,9 +60,6 @@ func getLinuxDefaultRoute() (gateway string, iface string, err error) {
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
 		for i := 0; i < len(fields); i++ {
 			if fields[i] == "via" && i+1 < len(fields) {
 				gateway = fields[i+1]
@@ -100,7 +96,6 @@ func (m *LinuxNetworkState) Setup(ifname, serverIP string) error {
 	m.gateway = gw
 	m.physIface = phys
 
-	// 1. Поднимаем интерфейс TUN
 	if out, err := exec.Command("ip", "addr", "replace", "10.88.0.2/24", "dev", ifname).CombinedOutput(); err != nil {
 		return fmt.Errorf("ip addr failed: %v (%s)", err, string(out))
 	}
@@ -109,7 +104,6 @@ func (m *LinuxNetworkState) Setup(ifname, serverIP string) error {
 	}
 	_ = exec.Command("ip", "-6", "addr", "replace", "fd00:88::2/128", "dev", ifname).Run()
 
-	// 2. Маршрут-исключение до VPN-сервера через физический шлюз
 	if gw != "" {
 		if out, err := exec.Command("ip", "-4", "route", "replace", serverIP+"/32", "via", gw, "dev", phys).CombinedOutput(); err != nil {
 			return fmt.Errorf("bypass route failed: %v (%s)", err, string(out))
@@ -120,13 +114,11 @@ func (m *LinuxNetworkState) Setup(ifname, serverIP string) error {
 		}
 	}
 
-	// 3. Маршрутизация всего IPv4 через TUN + блокировка утечек IPv6
 	_ = exec.Command("ip", "-4", "route", "replace", "0.0.0.0/1", "dev", ifname).Run()
 	_ = exec.Command("ip", "-4", "route", "replace", "128.0.0.0/1", "dev", ifname).Run()
 	_ = exec.Command("ip", "-6", "route", "replace", "::/1", "dev", ifname).Run()
 	_ = exec.Command("ip", "-6", "route", "replace", "8000::/1", "dev", ifname).Run()
 
-	// 4. Настройка DNS 1.1.1.1 (внутри туннеля)
 	if hasSystemdResolved() {
 		_ = exec.Command("resolvectl", "dns", ifname, "1.1.1.1").Run()
 		_ = exec.Command("resolvectl", "domain", ifname, "~.").Run()

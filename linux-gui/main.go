@@ -55,7 +55,7 @@ func main() {
 	a := app.NewWithID("com.example.winrmvpn.linux")
 	a.Settings().SetTheme(theme.DarkTheme())
 
-	w := a.NewWindow("WinRM-VPN v0.1.1 (Linux GUI)")
+	w := a.NewWindow("WinRM-VPN v0.2.0 (Linux GUI)")
 	w.Resize(fyne.NewSize(520, 720))
 
 	prefs := a.Preferences()
@@ -64,7 +64,7 @@ func main() {
 	logoLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	logoLabel.Alignment = fyne.TextAlignCenter
 
-	subTitle := widget.NewLabel("v0.1.1  |  Should looks like Ansible (Linux x86_64)")
+	subTitle := widget.NewLabel("v0.2.0  |  Should looks like Ansible (Linux x86_64)")
 	subTitle.TextStyle = fyne.TextStyle{Monospace: true}
 	subTitle.Alignment = fyne.TextAlignCenter
 
@@ -89,10 +89,10 @@ func main() {
 	btnInfo := widget.NewButton("(?)", func() {
 		dialog.ShowInformation(
 			"Проверка соединения (Watchdog)",
-			"При включённом переключателе и активном VPN-туннеле клиент отслеживает его работоспособность:\n\n"+
-				"1. Раз в случайный интервал от 30 до 60 секунд отправляется ping 1.1.1.1.\n"+
-				"2. Если ping не прошёл, через 10–20 секунд выполняется повторный ping 1.1.1.1.\n"+
-				"3. При повторной неудаче VPN автоматически переподключается.",
+			"При включённом переключателе и активном туннеле:\n\n"+
+				"1. Пассивный контроль: если за последние 30-60с приходили данные, проверок нет.\n"+
+				"2. В простое отправляется WinRM KeepAlive фрейм (размером под SOAP).\n"+
+				"3. При отсутствии ответа - повтор через 10-20с, затем перезапуск VPN.",
 			w,
 		)
 	})
@@ -128,31 +128,19 @@ func main() {
 		case "CONNECTING":
 			statusText.Text = "Статус: Подключение к серверу..."
 			statusText.Color = color.NRGBA{R: 255, G: 213, B: 79, A: 255}
-			btnConnect.Disable()
-			btnDisconnect.Enable()
-			btnPing.Disable()
-			btnCheckIP.Disable()
+			btnConnect.Disable(); btnDisconnect.Enable(); btnPing.Disable(); btnCheckIP.Disable()
 		case "CONNECTED":
 			statusText.Text = "Статус: Подключено"
 			statusText.Color = color.NRGBA{R: 0, G: 230, B: 118, A: 255}
-			btnConnect.Disable()
-			btnDisconnect.Enable()
-			btnPing.Enable()
-			btnCheckIP.Enable()
+			btnConnect.Disable(); btnDisconnect.Enable(); btnPing.Enable(); btnCheckIP.Enable()
 		case "ERROR":
 			statusText.Text = "Статус: Не удалось подключиться — VPN выключен"
 			statusText.Color = color.NRGBA{R: 255, G: 82, B: 82, A: 255}
-			btnConnect.Enable()
-			btnDisconnect.Disable()
-			btnPing.Disable()
-			btnCheckIP.Disable()
+			btnConnect.Enable(); btnDisconnect.Disable(); btnPing.Disable(); btnCheckIP.Disable()
 		default:
 			statusText.Text = "Статус: Отключено"
 			statusText.Color = color.NRGBA{R: 207, G: 216, B: 220, A: 255}
-			btnConnect.Enable()
-			btnDisconnect.Disable()
-			btnPing.Disable()
-			btnCheckIP.Disable()
+			btnConnect.Enable(); btnDisconnect.Disable(); btnPing.Disable(); btnCheckIP.Disable()
 		}
 		statusText.Refresh()
 	}
@@ -170,17 +158,17 @@ func main() {
 			port, _ = strconv.Atoi(parts[1])
 		}
 		if srv == "" || len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || port < 1 || port > 65535 {
-			errorText.Text = "Ошибка: укажите сервер в формате IP:Port (напр. 203.0.113.10:5986)."
+			errorText.Text = "Ошибка: укажите сервер в формате IP:Port."
 			errorText.Show()
 			return
 		}
 		if psk == "" {
-			errorText.Text = "Ошибка: не указан Pre-Shared Key (PSK)."
+			errorText.Text = "Ошибка: не указан PSK."
 			errorText.Show()
 			return
 		}
 		if pin != "" && !hexPinRe.MatchString(pin) {
-			errorText.Text = "Ошибка: SHA-256 Pin должен содержать ровно 64 hex-символа."
+			errorText.Text = "Ошибка: SHA-256 Pin должен содержать 64 hex-символа."
 			errorText.Show()
 			return
 		}
@@ -191,10 +179,8 @@ func main() {
 		prefs.SetString("pin", pin)
 		prefs.SetBool("check_conn", checkConn.Checked)
 
-		pingText.Text = ""
-		pingText.Refresh()
-		ipText.Text = ""
-		ipText.Refresh()
+		pingText.Text = ""; pingText.Refresh()
+		ipText.Text = ""; ipText.Refresh()
 
 		setUIState("CONNECTING")
 		go func() {
@@ -210,10 +196,8 @@ func main() {
 	btnDisconnect = widget.NewButton("Disconnect", func() {
 		go func() {
 			_ = stopHelper()
-			pingText.Text = ""
-			pingText.Refresh()
-			ipText.Text = ""
-			ipText.Refresh()
+			pingText.Text = ""; pingText.Refresh()
+			ipText.Text = ""; ipText.Refresh()
 			setUIState("DISCONNECTED")
 		}()
 	})
@@ -223,7 +207,6 @@ func main() {
 		pingText.Text = "Выполняется ping 8.8.8.8..."
 		pingText.Color = color.NRGBA{R: 255, G: 213, B: 79, A: 255}
 		pingText.Refresh()
-
 		go func() {
 			code, msg := callCtl("/ping")
 			pingText.Text = msg
@@ -241,7 +224,6 @@ func main() {
 		ipText.Text = "Запрос ifconfig.io..."
 		ipText.Color = color.NRGBA{R: 255, G: 213, B: 79, A: 255}
 		ipText.Refresh()
-
 		go func() {
 			code, msg := callCtl("/checkip")
 			ipText.Text = msg
@@ -256,29 +238,20 @@ func main() {
 	btnCheckIP.Disable()
 
 	content := container.NewVBox(
-		logoLabel,
-		subTitle,
-		widget.NewSeparator(),
-		widget.NewLabel("Server IP:Port"),
-		serverEntry,
-		widget.NewLabel("Pre-Shared Key (PSK)"),
-		pskEntry,
-		widget.NewLabel("Cert SHA-256 Pin"),
-		pinEntry,
-		checkRow,
-		errorText,
+		logoLabel, subTitle, widget.NewSeparator(),
+		widget.NewLabel("Server IP:Port"), serverEntry,
+		widget.NewLabel("Pre-Shared Key (PSK)"), pskEntry,
+		widget.NewLabel("Cert SHA-256 Pin"), pinEntry,
+		checkRow, errorText,
 		container.NewGridWithColumns(2, btnConnect, btnDisconnect),
 		statusText,
 		container.NewGridWithColumns(2, btnPing, btnCheckIP),
-		pingText,
-		ipText,
-		widget.NewLabel("Логи подключения:"),
-		logScroll,
+		pingText, ipText,
+		widget.NewLabel("Логи подключения:"), logScroll,
 	)
 
 	w.SetContent(container.NewPadded(content))
 
-	// Фоновый опрос состояния хелпера
 	go func() {
 		lastState := "DISCONNECTED"
 		lastLogCount := 0
@@ -306,16 +279,13 @@ func main() {
 		}
 	}()
 
-	w.SetOnClosed(func() {
-		_ = stopHelper()
-	})
-
+	w.SetOnClosed(func() { _ = stopHelper() })
 	w.ShowAndRun()
 }
 
 func ensureHelperExtracted() error {
 	if len(embeddedHelper) == 0 {
-		return fmt.Errorf("встроенный winrm-vpn-linux-helper пуст")
+		return fmt.Errorf("встроенный хелпер пуст")
 	}
 	wantHash := sha256.Sum256(embeddedHelper)
 	if existing, err := os.ReadFile(helperPath); err == nil {
@@ -325,29 +295,18 @@ func ensureHelperExtracted() error {
 			return nil
 		}
 	}
-	if err := os.WriteFile(helperPath, embeddedHelper, 0755); err != nil {
-		return fmt.Errorf("ошибка распаковки хелпера: %w", err)
-	}
-	return nil
+	return os.WriteFile(helperPath, embeddedHelper, 0755)
 }
 
 func launchHelper(server, psk, pin string, checkConn bool) error {
 	if err := ensureHelperExtracted(); err != nil {
 		return err
 	}
-
-	cfg := map[string]any{
-		"server":     server,
-		"psk":        psk,
-		"pin":        pin,
-		"check_conn": checkConn,
-	}
-	cfgBytes, _ := json.Marshal(cfg)
+	cfgBytes, _ := json.Marshal(map[string]any{"server": server, "psk": psk, "pin": pin, "check_conn": checkConn})
 	cfgPath := fmt.Sprintf("/tmp/winrm-vpn-linux-cfg-%d.json", os.Getpid())
 	if err := os.WriteFile(cfgPath, cfgBytes, 0600); err != nil {
 		return err
 	}
-
 	shellCmd := fmt.Sprintf("nohup '%s' -config '%s' >/tmp/winrm-vpn-linux.log 2>&1 </dev/null &", helperPath, cfgPath)
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 {
@@ -358,10 +317,9 @@ func launchHelper(server, psk, pin string, checkConn bool) error {
 		_ = os.Remove(cfgPath)
 		return fmt.Errorf("не найден pkexec (установите policykit-1 или запустите GUI с sudo)")
 	}
-
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(cfgPath)
-		return fmt.Errorf("запуск отменён или неверные права (%v)", err)
+		return fmt.Errorf("запуск отменён или ошибка прав (%v)", err)
 	}
 	return nil
 }
@@ -372,10 +330,7 @@ func loadMeta() (*CtlMeta, error) {
 		return nil, err
 	}
 	var m CtlMeta
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, err
-	}
-	return &m, nil
+	return &m, json.Unmarshal(raw, &m)
 }
 
 func fetchStatus() (*StatusResponse, error) {
@@ -395,10 +350,7 @@ func fetchStatus() (*StatusResponse, error) {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	var st StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
-		return nil, err
-	}
-	return &st, nil
+	return &st, json.NewDecoder(resp.Body).Decode(&st)
 }
 
 func callCtl(path string) (int, string) {
