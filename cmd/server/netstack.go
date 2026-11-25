@@ -74,29 +74,31 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 		onOut:  onOut,
 	}
 
+	// Асинхронный TCP-форвардер: net.DialTimeout НЕ блокирует InjectPacket и HTTP Send-канал
 	tcpFwd := tcp.NewForwarder(s, 0, 2048, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
-		outConn, err := net.DialTimeout("tcp4", dst, 10*time.Second)
-		if err != nil {
-			r.Complete(true)
-			return
-		}
+		go func(req *tcp.ForwarderRequest, target string) {
+			outConn, err := net.DialTimeout("tcp4", target, 8*time.Second)
+			if err != nil {
+				req.Complete(true)
+				return
+			}
 
-		var wq waiter.Queue
-		ep, tcpErr := r.CreateEndpoint(&wq)
-		if tcpErr != nil {
-			_ = outConn.Close()
-			r.Complete(true)
-			return
-		}
-		r.Complete(false)
+			var wq waiter.Queue
+			ep, tcpErr := req.CreateEndpoint(&wq)
+			if tcpErr != nil {
+				_ = outConn.Close()
+				req.Complete(true)
+				return
+			}
+			req.Complete(false)
 
-		inConn := gonet.NewTCPConn(&wq, ep)
-		go func() {
+			inConn := gonet.NewTCPConn(&wq, ep)
 			defer inConn.Close()
 			defer outConn.Close()
+
 			done := make(chan struct{}, 2)
 			go func() {
 				_, _ = io.Copy(outConn, inConn)
@@ -110,7 +112,7 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 			case <-done:
 			case <-ctx.Done():
 			}
-		}()
+		}(r, dst)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
@@ -125,15 +127,14 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 		}
 		inConn := gonet.NewUDPConn(s, &wq, ep)
 
-		outConn, err := net.DialTimeout("udp4", dst, 5*time.Second)
-		if err != nil {
-			_ = inConn.Close()
-			return
-		}
-
 		go func() {
 			defer inConn.Close()
+			outConn, err := net.DialTimeout("udp4", dst, 5*time.Second)
+			if err != nil {
+				return
+			}
 			defer outConn.Close()
+
 			done := make(chan struct{}, 2)
 			go func() {
 				buf := make([]byte, 2048)
