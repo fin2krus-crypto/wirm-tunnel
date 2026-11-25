@@ -3,6 +3,7 @@ package com.example.winrmvpn
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -109,18 +110,40 @@ __        ___       ____  __  __    __     ______  _   _
             setTextColor(Color.WHITE)
             setHintTextColor(Color.parseColor("#78909C"))
         }
+
+        val pskRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         pskInput = EditText(this).apply {
             hint = "Pre-Shared Key (PSK)"
             setText(prefs.getString("psk", ""))
             setTextColor(Color.WHITE)
             setHintTextColor(Color.parseColor("#78909C"))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val btnPastePsk = createSmallPasteButton {
+            pasteFromClipboard(pskInput)
+        }
+        pskRow.addView(pskInput)
+        pskRow.addView(btnPastePsk)
+
+        val pinRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
         pinInput = EditText(this).apply {
             hint = "Cert SHA-256 Pin (64 hex, optional)"
             setText(prefs.getString("pin", ""))
             setTextColor(Color.WHITE)
             setHintTextColor(Color.parseColor("#78909C"))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
+        val btnPastePin = createSmallPasteButton {
+            pasteFromClipboard(pinInput)
+        }
+        pinRow.addView(pinInput)
+        pinRow.addView(btnPastePin)
 
         val checkRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -307,7 +330,6 @@ __        ___       ____  __  __    __     ______  _   _
             addView(logText)
         }
 
-        // Гарантированный автоскролл вниз сразу после перерасчёта высоты текста
         logText.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
             if (bottom > oldBottom && autoScrollEnabled) {
                 logScroll.post {
@@ -319,8 +341,8 @@ __        ___       ____  __  __    __     ______  _   _
         layout.addView(logoView)
         layout.addView(versionView)
         layout.addView(serverInput)
-        layout.addView(pskInput)
-        layout.addView(pinInput)
+        layout.addView(pskRow)
+        layout.addView(pinRow)
         layout.addView(checkRow)
         layout.addView(errorText)
         layout.addView(btnRow)
@@ -339,6 +361,42 @@ __        ___       ____  __  __    __     ______  _   _
 
         applyStateUi(VpnStateBus.currentState)
         logScroll.post { logScroll.scrollTo(0, logText.bottom) }
+    }
+
+    private fun createSmallPasteButton(onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = "Вставить"
+            textSize = 11f
+            minWidth = 0
+            minHeight = 0
+            minimumWidth = 0
+            minimumHeight = 0
+            setPadding(22, 14, 22, 14)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                leftMargin = 10
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun pasteFromClipboard(target: EditText) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = cm.primaryClip
+        if (!cm.hasPrimaryClip() || clip == null || clip.itemCount == 0) {
+            showValidationError("Буфер обмена пуст.")
+            return
+        }
+        val text = clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
+        if (text.isNullOrEmpty()) {
+            showValidationError("В буфере обмена нет текста.")
+            return
+        }
+        target.setText(text)
+        target.setSelection(text.length)
+        errorText.visibility = View.GONE
     }
 
     override fun onDestroy() {
