@@ -480,7 +480,7 @@ const webPanelHTML = `<!DOCTYPE html>
   \ \ /\ / /| | '_ \| |_) | |\/| |____\ \ / /| |_) |  \| |
    \ V  V / | | | | |  _ &lt;| |  | |_____\ V / |  __/| |\  |
     \_/\_/  |_|_| |_|_| \_\_|  |_|      \_/  |_|   |_| \_|</pre>
-    <div class="subtitle" id="subInfo">WinRM-VPN Server v0.4.0 | Панель управления</div>
+    <div class="subtitle" id="subInfo">WinRM-VPN Server v0.4.1 | Панель управления</div>
     <div><span class="status-pill"><span class="dot dot-off" id="vpnDot"></span><span id="vpnStatusText">Загрузка...</span></span></div>
     <div class="pin-bar"><span><b>Cert SHA-256 Pin:</b> <span id="certPinVal">—</span></span><button class="btn-sm" onclick="copyText(document.getElementById('certPinVal').textContent)">Копировать</button></div>
   </div>

@@ -95,7 +95,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.2.0  |  Should looks like Ansible"
+            text = "v0.4.1  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))

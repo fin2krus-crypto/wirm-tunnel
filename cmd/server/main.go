@@ -32,7 +32,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.4.0"
+const AppVersion = "0.4.1"
 
 //go:embed embedded/winrm-tls-front
 var embeddedTlsFrontBin []byte

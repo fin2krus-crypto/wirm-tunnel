@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	AppVersion         = "0.2.0"
+	AppVersion         = "0.4.1"
 	maxConnectAttempts = 3
 	ctlMetaPath        = "/tmp/winrm-vpn-linux-ctl.json"
 )

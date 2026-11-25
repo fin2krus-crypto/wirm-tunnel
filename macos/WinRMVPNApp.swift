@@ -193,7 +193,7 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("WinRM-VPN").font(.system(.headline, design: .monospaced)).foregroundColor(.green)
-                Text("v0.2.0").font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                Text("v0.4.1").font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
                 Spacer()
                 Circle().fill(statusColor).frame(width: 9, height: 9)
                 Text(statusLabel).font(.caption).foregroundColor(statusColor)

@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Server v0.4.0 + Clients v0.2.0)
+name: Build WinRM VPN (Server v0.4.1 + Clients v0.4.1)
 
 on:
   push:
@@ -55,7 +55,7 @@ jobs:
         run: |
           go mod tidy
 
-      - name: Build All-in-One Linux x86_64 Server Binary (v0.4.0)
+      - name: Build All-in-One Linux x86_64 Server Binary (v0.4.1)
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/winrm-vpn-server ./cmd/server
@@ -76,8 +76,8 @@ jobs:
             kill $SRV_PID
             exit 1
           fi
-          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.4.0"'
-          echo "OK: Server v0.4.0 passed OpenSSL3 CBC, ChaCha20 Rejection & Web Panel checks!"
+          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.4.1"'
+          echo "OK: Server v0.4.1 passed OpenSSL3 CBC, ChaCha20 Rejection & Web Panel checks!"
           kill $SRV_PID
 
       - name: Build Android Native Core (.aar) via Gomobile
@@ -193,11 +193,11 @@ jobs:
           path: release_files
           merge-multiple: true
 
-      - name: Publish all binaries to GitHub Release v0.4.0
+      - name: Publish all binaries to GitHub Release v0.4.1
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.4.0
-          name: WinRM-VPN (Server v0.4.0 / Clients v0.2.0)
+          tag_name: v0.4.1
+          name: WinRM-VPN (Server v0.4.1 / Clients v0.4.1)
           files: |
             release_files/winrm-vpn-server
             release_files/winrm-vpn-client.apk
