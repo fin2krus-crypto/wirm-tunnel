@@ -26,7 +26,7 @@ int synack_win_order(struct __sk_buff *skb) {
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
-    if (ip->protocol != IPPROTO_TCP || ip->ihl < 5)
+    if (ip->protocol != 6 || ip->ihl < 5)
         return TC_ACT_OK;
 
     __u32 l3_len = (__u32)ip->ihl * 4;
@@ -112,7 +112,7 @@ int synack_win_order(struct __sk_buff *skb) {
     if (bpf_skb_store_bytes(skb, l4_off + 20, new_opts, 12, 0) < 0)
         return TC_ACT_OK;
 
-    bpf_l4_csum_replace(skb, l4_off + offsetof(struct tcphdr, check), 0, diff, 0);
+    bpf_l4_csum_replace(skb, l4_off + __builtin_offsetof(struct tcphdr, check), 0, diff, 0);
     return TC_ACT_OK;
 }
 
