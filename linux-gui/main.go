@@ -55,7 +55,7 @@ func main() {
 	a := app.NewWithID("com.example.winrmvpn.linux")
 	a.Settings().SetTheme(theme.DarkTheme())
 
-	w := a.NewWindow("WinRM-VPN v0.4.4 (Linux GUI)")
+	w := a.NewWindow("WinRM-VPN v0.4.5 (Linux GUI)")
 	w.Resize(fyne.NewSize(520, 720))
 
 	prefs := a.Preferences()
@@ -64,7 +64,7 @@ func main() {
 	logoLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	logoLabel.Alignment = fyne.TextAlignCenter
 
-	subTitle := widget.NewLabel("v0.4.4  |  Should looks like Ansible (Linux x86_64)")
+	subTitle := widget.NewLabel("v0.4.5  |  Should looks like Ansible (Linux x86_64)")
 	subTitle.TextStyle = fyne.TextStyle{Monospace: true}
 	subTitle.Alignment = fyne.TextAlignCenter
 

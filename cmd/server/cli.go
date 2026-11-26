@@ -40,7 +40,7 @@ func runInteractiveCLI() {
 		snap := getDashboardSnapshot(dataDir)
 		printDashboard(snap, cachedExtIP, dataDir)
 
-		fmt.Print("Выберите пункт [0-10]: ")
+		fmt.Print("Выберите пункт [0-11]: ")
 		if !scanner.Scan() {
 			return
 		}
@@ -69,6 +69,8 @@ func runInteractiveCLI() {
 			menuSpeedtest(scanner)
 		case "10":
 			menuWebPanel(scanner, dataDir)
+		case "11":
+			menuRuCheck(scanner, cachedExtIP)
 		case "0":
 			fmt.Println("Выход.")
 			return
@@ -133,6 +135,7 @@ func printDashboard(snap ServerStatsSnapshot, extIP, dataDir string) {
 	fmt.Println("  8. Удаление сервера")
 	fmt.Println("  9. Проверка скорости (speedtest.net)")
 	fmt.Println("  10. Веб-интерфейс (включить / выключить)")
+	fmt.Println("  11. Проверка доступности из РФ (ТСПУ / РКН)")
 	fmt.Println("  0. Выход")
 	fmt.Println("================================================================")
 }
@@ -771,4 +774,153 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dм %dс", mins, sec)
 	}
 	return fmt.Sprintf("%dс", sec)
+}
+
+func menuRuCheck(scanner *bufio.Scanner, extIP string) {
+	for {
+		fmt.Println("\n================= ПРОВЕРКА ДОСТУПНОСТИ ИЗ РФ (ТСПУ / РКН) =================")
+		fmt.Printf("  Проверяемый IP сервера: %s (порт 5986)\n", extIP)
+		fmt.Println("  1. Friskes/vpn-infra (ru-reach: Check-Host RU + Globalping операторы РФ)")
+		fmt.Println("  2. jsdelivr/globalping-cli (MTR трассировка и пинг из сетей РФ)")
+		fmt.Println("  3. diasnull/check-host (Проверка доступности TCP 5986 через узлы РФ)")
+		fmt.Println("  4. runetfreedom / itdoginfo (Сверка с реестром РКН + тест iperf3 до РФ)")
+		fmt.Println("  0. Назад в главное меню")
+		fmt.Print("Ваш выбор: ")
+		if !scanner.Scan() { return }
+		switch strings.TrimSpace(scanner.Text()) {
+		case "0":
+			return
+		case "1":
+			runRuReach(scanner, extIP)
+		case "2":
+			runGlobalping(scanner, extIP)
+		case "3":
+			runCheckHost(scanner, extIP)
+		case "4":
+			runRknIperf(scanner, extIP)
+		default:
+			fmt.Println("Неверный выбор.")
+		}
+	}
+}
+
+func runRuReach(scanner *bufio.Scanner, extIP string) {
+	fmt.Printf("\n[*] Запуск ru-reach (Friskes/vpn-infra) для %s:5986...\n", extIP)
+	cmd := exec.Command("bash", "-c", fmt.Sprintf(`
+		mkdir -p /tmp/winrm-check && cd /tmp/winrm-check
+		curl -fsSL https://raw.githubusercontent.com/Friskes/vpn-infra/main/tools/measure/ru-reach.py -o ru-reach.py 2>/dev/null || true
+		if [ -s ru-reach.py ]; then
+			python3 ru-reach.py --target "%s" --port 5986 2>&1 || python3 ru-reach.py "%s" 5986 2>&1 || python3 ru-reach.py -h
+		else
+			echo "[!] Не удалось загрузить ru-reach.py"
+		fi
+	`, extIP, extIP))
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	_ = cmd.Run()
+	waitForZero(scanner)
+}
+
+func runGlobalping(scanner *bufio.Scanner, extIP string) {
+	fmt.Println("\n[*] Подготовка jsdelivr/globalping-cli...")
+	cmd := exec.Command("bash", "-c", fmt.Sprintf(`
+		if ! command -v globalping >/dev/null 2>&1; then
+			echo "[*] Установка globalping..."
+			curl -fsSL https://github.com/jsdelivr/globalping-cli/releases/latest/download/globalping-linux-x86_64 -o /usr/local/bin/globalping 2>/dev/null && chmod +x /usr/local/bin/globalping || true
+		fi
+		if command -v globalping >/dev/null 2>&1; then
+			echo -e "\n--- 1. Пинг из домашних сетей РФ (eyeball) ---"
+			globalping ping "%s" --from Russia --limit 4 || true
+			echo -e "\n--- 2. MTR трассировка из РФ к %s:5986 ---"
+			globalping traceroute "%s" --from Russia --limit 2 --port 5986 || globalping traceroute "%s" --from Russia --limit 2 || true
+		else
+			echo "[!] Не удалось установить globalping-cli (проверьте интернет)."
+		fi
+	`, extIP, extIP, extIP, extIP))
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	_ = cmd.Run()
+	waitForZero(scanner)
+}
+
+func runCheckHost(scanner *bufio.Scanner, extIP string) {
+	fmt.Printf("\n[*] Проверка доступности порта %s:5986 через check-host.net...\n", extIP)
+	cmd := exec.Command("bash", "-c", fmt.Sprintf(`
+		python3 - << 'PYEOF'
+import urllib.request, json, time, sys
+
+ip = "%s"
+port = 5986
+headers = {"User-Agent": "curl/8.5.0", "Accept": "application/json"}
+
+print(f"[*] Отправка запроса TCP проверки порта {ip}:{port} в check-host.net...")
+req = urllib.request.Request(f"https://check-host.net/check-tcp?host={ip}:{port}&max_nodes=15", headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        init_data = json.loads(r.read().decode())
+except Exception as e:
+    print(f"[!] Ошибка запроса к check-host: {e}")
+    sys.exit(0)
+
+req_id = init_data.get("request_id")
+nodes = init_data.get("nodes", {})
+ru_nodes = [nid for nid, info in nodes.items() if len(info) > 1 and info[1] == "ru"]
+
+if not req_id or not ru_nodes:
+    print("[!] Не найдены российские узлы в текущей выборке check-host. Попробуйте снова.")
+    sys.exit(0)
+
+print(f"[*] Ожидание ответов от {len(ru_nodes)} узлов в РФ...")
+time.sleep(4)
+
+res_req = urllib.request.Request(f"https://check-host.net/check-result/{req_id}", headers=headers)
+try:
+    with urllib.request.urlopen(res_req, timeout=10) as r:
+        results = json.loads(r.read().decode())
+except Exception as e:
+    print(f"[!] Ошибка получения результатов: {e}")
+    sys.exit(0)
+
+print("\nРезультаты проверки порта 5986 из России:")
+for nid in ru_nodes:
+    city = nodes[nid][2]
+    res = results.get(nid)
+    if res and len(res) > 0 and res[0]:
+        first = res[0][0]
+        if "error" in first:
+            print(f"  [X] {city} ({nid}): ТАЙМАУТ / ЗАБЛОКИРОВАН ({first['error']})")
+        else:
+            time_ms = first.get("time", 0) * 1000
+            print(f"  [OK] {city} ({nid}): ДОСТУПЕН (RTT: {time_ms:.1f} ms)")
+    else:
+        print(f"  [?] {city} ({nid}): узел ещё не ответил")
+PYEOF
+	`, extIP))
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	_ = cmd.Run()
+	waitForZero(scanner)
+}
+
+func runRknIperf(scanner *bufio.Scanner, extIP string) {
+	fmt.Printf("\n[*] Сверка IP %s с базами блокировок РКН (runetfreedom)...\n", extIP)
+	cmd := exec.Command("bash", "-c", fmt.Sprintf(`
+		echo -n "  Проверка в реестре заблокированных IP... "
+		TMP_LIST=$(mktemp)
+		curl -fsSL --max-time 10 https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/main/blocked-ip.txt -o "$TMP_LIST" 2>/dev/null || true
+		if [ -s "$TMP_LIST" ]; then
+			if grep -q "^%s$" "$TMP_LIST"; then
+				echo -e "[0;31m[!] ВНИМАНИЕ: IP найден в списках блокировок РКН![0m"
+			else
+				echo -e "[0;32m[OK] IP отсутствует в списках блокировок.[0m"
+			fi
+		else
+			echo "[?] Не удалось скачать базу (таймаут)."
+		fi
+		rm -f "$TMP_LIST"
+
+		echo -e "\n[*] Замер скорости и шейпинга до серверов в РФ (itdoginfo/russian-iperf3-servers)..."
+		which iperf3 >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq iperf3 >/dev/null 2>&1 || true)
+		curl -fsSL https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh | bash || true
+	`, extIP))
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	_ = cmd.Run()
+	waitForZero(scanner)
 }
