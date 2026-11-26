@@ -40,7 +40,7 @@ func runInteractiveCLI() {
 		snap := getDashboardSnapshot(dataDir)
 		printDashboard(snap, cachedExtIP, dataDir)
 
-		fmt.Print("Выберите пункт [0-9]: ")
+		fmt.Print("Выберите пункт [0-10]: ")
 		if !scanner.Scan() {
 			return
 		}
@@ -67,6 +67,8 @@ func runInteractiveCLI() {
 			}
 		case "9":
 			menuSpeedtest(scanner)
+		case "10":
+			menuWebPanel(scanner, dataDir)
 		case "0":
 			fmt.Println("Выход.")
 			return
@@ -111,7 +113,11 @@ func printDashboard(snap ServerStatsSnapshot, extIP, dataDir string) {
 
 	fmt.Printf("  Статус сервиса     : %s\n", statusStr)
 	fmt.Printf("  Внешний IP         : %s\n", extIP)
-	fmt.Printf("  Веб-панель         : http://%s:%d\n", extIP, webPort)
+	if snap.WebEnabled || (snap.PID == 0 && loadPanelConfig(dataDir).Enabled) {
+		fmt.Printf("  Веб-панель         : http://%s:%d (ВКЛ)\n", extIP, webPort)
+	} else {
+		fmt.Println("  Веб-панель         : ВЫКЛЮЧЕНА")
+	}
 	fmt.Printf("  Время работы       : %s\n", uptimeStr)
 	fmt.Printf("  Пользователей      : всего %d  |  онлайн %d\n", snap.TotalUsers, snap.OnlineUsers)
 	fmt.Printf("  Трафик (с запуска) : Вх %s  |  Исх %s\n", formatBytes(snap.TotalRx), formatBytes(snap.TotalTx))
@@ -126,6 +132,7 @@ func printDashboard(snap ServerStatsSnapshot, extIP, dataDir string) {
 	fmt.Println("  7. Остановка сервера")
 	fmt.Println("  8. Удаление сервера")
 	fmt.Println("  9. Проверка скорости (speedtest.net)")
+	fmt.Println("  10. Веб-интерфейс (включить / выключить)")
 	fmt.Println("  0. Выход")
 	fmt.Println("================================================================")
 }
@@ -293,36 +300,70 @@ func menuUpdateServer(scanner *bufio.Scanner) {
 		fmt.Println("  1. Запустить обновление с GitHub (update.sh)")
 		fmt.Println("  0. Назад в главное меню")
 		fmt.Print("Ваш выбор: ")
-		if !scanner.Scan() {
-			return
-		}
-		choice := strings.TrimSpace(scanner.Text())
-		switch choice {
+		if !scanner.Scan() { return }
+		switch strings.TrimSpace(scanner.Text()) {
 		case "0":
 			return
 		case "1":
-			fmt.Print("Если репозиторий приватный, введите GITHUB_TOKEN (или Enter для публичного, 0 - отмена): ")
-			if !scanner.Scan() {
-				return
-			}
-			token := strings.TrimSpace(scanner.Text())
-			if token == "0" {
-				continue
-			}
 			url := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/update.sh", defaultGitHubRepo)
-			var cmd *exec.Cmd
-			if token != "" {
-				cmd = exec.Command("bash", "-c", fmt.Sprintf(`curl -fsSL -H "Authorization: Bearer %s" %s | GITHUB_TOKEN="%s" bash`, token, url, token))
-			} else {
-				cmd = exec.Command("bash", "-c", fmt.Sprintf(`curl -fsSL %s | bash`, url))
-			}
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.Stdin = os.Stdin
+			fmt.Printf("\n[*] Загрузка и запуск %s...\n", url)
+			cmd := exec.Command("bash", "-c", fmt.Sprintf("curl -fsSL %s | bash", url))
+			cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 			if err := cmd.Run(); err != nil {
-				fmt.Printf("\n[ОШИБКА] %v\n", err)
+				fmt.Printf("\n[ОШИБКА] Обновление не удалось: %v\n", err)
 			} else {
-				fmt.Println("\n[OK] Обновление выполнено.")
+				fmt.Println("\n[OK] Сервер обновлён. Перезапустите winrm-vpn-server для обновления меню.")
+			}
+			waitForZero(scanner)
+			return
+		}
+	}
+}
+
+func menuWebPanel(scanner *bufio.Scanner, dataDir string) {
+	for {
+		cfg := loadPanelConfig(dataDir)
+		liveSnap, liveErr := fetchLiveStats(dataDir)
+		enabled := cfg.Enabled
+		if liveErr == nil { enabled = liveSnap.WebEnabled }
+		st := "ВЫКЛЮЧЕН"
+		if enabled { st = fmt.Sprintf("ВКЛЮЧЁН (порт :%d)", cfg.Port) }
+		fmt.Println("\n==================== ВЕБ-ИНТЕРФЕЙС =============================")
+		fmt.Printf("  Текущий статус: %s\n", st)
+		fmt.Println("  1. Включить веб-интерфейс")
+		fmt.Println("  2. Выключить веб-интерфейс")
+		fmt.Println("  0. Назад в главное меню")
+		fmt.Print("Ваш выбор: ")
+		if !scanner.Scan() { return }
+		switch strings.TrimSpace(scanner.Text()) {
+		case "0":
+			return
+		case "1":
+			if liveErr == nil {
+				if err := sendControlCommand(dataDir, "/web/start"); err != nil {
+					fmt.Printf("[ОШИБКА] %v\n", err)
+				} else {
+					fmt.Printf("[OK] Веб-интерфейс включён на порту :%d\n", cfg.Port)
+				}
+			} else {
+				cfg.Enabled = true
+				_ = savePanelConfig(dataDir, cfg)
+				openUfwPortIfActive(cfg.Port)
+				fmt.Printf("[OK] Веб-интерфейс будет включён при запуске (порт :%d).\n", cfg.Port)
+			}
+			waitForZero(scanner)
+			return
+		case "2":
+			if liveErr == nil {
+				if err := sendControlCommand(dataDir, "/web/stop"); err != nil {
+					fmt.Printf("[ОШИБКА] %v\n", err)
+				} else {
+					fmt.Println("[OK] Веб-интерфейс выключен.")
+				}
+			} else {
+				cfg.Enabled = false
+				_ = savePanelConfig(dataDir, cfg)
+				fmt.Println("[OK] Веб-интерфейс выключен в конфигурации.")
 			}
 			waitForZero(scanner)
 			return

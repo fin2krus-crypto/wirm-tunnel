@@ -1,4 +1,4 @@
-name: Build WinRM VPN (Server v0.4.2 + Clients v0.4.2)
+name: Build WinRM VPN (Server v0.4.3 + Clients v0.4.2)
 
 on:
   push:
@@ -76,8 +76,8 @@ jobs:
             kill $SRV_PID
             exit 1
           fi
-          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.4.2"'
-          echo "OK: Server v0.4.2 passed OpenSSL3 CBC, ChaCha20 Rejection & Web Panel checks!"
+          curl -fsS http://127.0.0.1:49777/api/stats | grep -q '"version":"0.4.3"'
+          echo "OK: Server v0.4.3 passed OpenSSL3 CBC, ChaCha20 Rejection & Web Panel checks!"
           kill $SRV_PID
 
       - name: Build Android Native Core (.aar) via Gomobile
@@ -196,8 +196,8 @@ jobs:
       - name: Publish all binaries to GitHub Release v0.4.2
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.4.2
-          name: WinRM-VPN (Server v0.4.2 / Clients v0.4.2)
+          tag_name: v0.4.3
+          name: WinRM-VPN (Server v0.4.3 / Clients v0.4.2)
           files: |
             release_files/winrm-vpn-server
             release_files/winrm-vpn-client.apk

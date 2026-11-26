@@ -1,4 +1,4 @@
-# WinRM-VPN (Server v0.4.2 / Clients v0.4.2)
+# WinRM-VPN (Server v0.4.3 / Clients v0.4.2)
 
 Стелс-VPN для тестирования DPI-систем с мимикрией под **Ansible (`pywinrm` / OpenSSL 3.x)** и **Windows Server 2022/2025 WinRM over HTTPS (`5986/TCP`)**.
 

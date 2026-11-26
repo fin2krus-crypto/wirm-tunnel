@@ -32,7 +32,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.4.2"
+const AppVersion = "0.4.3"
 
 //go:embed embedded/winrm-tls-front
 var embeddedTlsFrontBin []byte
@@ -420,11 +420,13 @@ func main() {
 		log.Fatalf("Failed to start VPN engine: %v", err)
 	}
 
-	webPanel, err := StartWebPanel(dataDir, *webPortFlag, statsMgr, vpnEngine)
+	webPanel, err := InitWebPanel(dataDir, *webPortFlag, statsMgr, vpnEngine)
 	if err != nil {
 		log.Printf("[WARN] Веб-панель не запущена: %v", err)
-	} else {
+	} else if webPanel.IsRunning() {
 		log.Printf("[WEB] Веб-панель управления доступна на порту :%d", webPanel.Port())
+	} else {
+		log.Printf("[WEB] Веб-панель выключена (включить: меню CLI -> п.10)")
 	}
 
 	go func() {
@@ -439,7 +441,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	if err := statsMgr.StartControlSocket(vpnEngine, shutdownFn); err != nil {
+	if err := statsMgr.StartControlSocket(vpnEngine, webPanel, shutdownFn); err != nil {
 		log.Printf("[WARN] Control socket not started: %v", err)
 	}
 
@@ -452,7 +454,7 @@ func main() {
 
 	log.Printf("================================================================")
 	log.Printf("WinRM-VPN Server v%s Ready on %s", AppVersion, *listenAddr)
-	if webPanel != nil {
+	if webPanel != nil && webPanel.IsRunning() {
 		log.Printf("Web Control Panel : http://0.0.0.0:%d", webPanel.Port())
 	}
 	log.Printf("Emulated Hostname : %s", vpnEngine.hostName)

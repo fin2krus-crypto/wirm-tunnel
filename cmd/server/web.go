@@ -22,27 +22,23 @@ const defaultWebPort = 49777
 
 type PanelConfig struct {
 	Port     int    `json:"port"`
+	Enabled  bool   `json:"enabled"`
 	Password string `json:"password,omitempty"`
 }
 
 func loadPanelConfig(dataDir string) PanelConfig {
-	cfg := PanelConfig{Port: defaultWebPort}
-	raw, err := os.ReadFile(filepath.Join(dataDir, "panel.json"))
-	if err == nil {
+	cfg := PanelConfig{Port: defaultWebPort, Enabled: true}
+	if raw, err := os.ReadFile(filepath.Join(dataDir, "panel.json")); err == nil {
 		_ = json.Unmarshal(raw, &cfg)
 	}
-	if cfg.Port < 1 || cfg.Port > 65535 {
-		cfg.Port = defaultWebPort
-	}
+	if cfg.Port < 1 || cfg.Port > 65535 { cfg.Port = defaultWebPort }
 	return cfg
 }
 
 func savePanelConfig(dataDir string, cfg PanelConfig) error {
 	_ = os.MkdirAll(dataDir, 0700)
 	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	return os.WriteFile(filepath.Join(dataDir, "panel.json"), data, 0600)
 }
 
@@ -58,75 +54,70 @@ type WebPanelServer struct {
 	handler     http.Handler
 }
 
-func StartWebPanel(dataDir string, portOverride int, statsMgr *StatsManager, vpnEngine *VPNEngine) (*WebPanelServer, error) {
+func InitWebPanel(dataDir string, portOverride int, statsMgr *StatsManager, vpnEngine *VPNEngine) (*WebPanelServer, error) {
 	cfg := loadPanelConfig(dataDir)
 	if portOverride > 0 && portOverride <= 65535 {
-		cfg.Port = portOverride
+		cfg.Port = portOverride; cfg.Enabled = true
 		_ = savePanelConfig(dataDir, cfg)
 	}
-	statsMgr.SetWebPort(cfg.Port)
-
-	var sk [16]byte
-	_, _ = rand.Read(sk[:])
-
-	wp := &WebPanelServer{
-		dataDir:    dataDir,
-		statsMgr:   statsMgr,
-		vpnEngine:  vpnEngine,
-		cfg:        cfg,
-		sessionKey: hex.EncodeToString(sk[:]),
-	}
+	var sk [16]byte; _, _ = rand.Read(sk[:])
+	wp := &WebPanelServer{dataDir: dataDir, statsMgr: statsMgr, vpnEngine: vpnEngine, cfg: cfg, sessionKey: hex.EncodeToString(sk[:])}
 	wp.handler = wp.buildRouter()
-
-	if err := wp.listenOnPort(cfg.Port); err != nil {
-		return nil, err
+	if cfg.Enabled {
+		if err := wp.listenOnPort(cfg.Port); err != nil {
+			statsMgr.SetWebStatus(cfg.Port, false)
+			return wp, err
+		}
+		statsMgr.SetWebStatus(cfg.Port, true)
+	} else {
+		statsMgr.SetWebStatus(cfg.Port, false)
 	}
 	return wp, nil
 }
 
-func (wp *WebPanelServer) Port() int {
+func (wp *WebPanelServer) Port() int { wp.mu.Lock(); defer wp.mu.Unlock(); return wp.cfg.Port }
+func (wp *WebPanelServer) IsRunning() bool { wp.mu.Lock(); defer wp.mu.Unlock(); return wp.curListener != nil }
+
+func (wp *WebPanelServer) Start() error {
 	wp.mu.Lock()
-	defer wp.mu.Unlock()
-	return wp.cfg.Port
+	if wp.curListener != nil {
+		wp.cfg.Enabled = true; c := wp.cfg; wp.mu.Unlock()
+		_ = savePanelConfig(wp.dataDir, c); wp.statsMgr.SetWebStatus(c.Port, true); return nil
+	}
+	port := wp.cfg.Port; wp.mu.Unlock()
+	if err := wp.listenOnPort(port); err != nil { return err }
+	wp.mu.Lock(); wp.cfg.Enabled = true; c := wp.cfg; wp.mu.Unlock()
+	_ = savePanelConfig(wp.dataDir, c); openUfwPortIfActive(port); wp.statsMgr.SetWebStatus(port, true)
+	return nil
+}
+
+func (wp *WebPanelServer) Stop() {
+	wp.mu.Lock()
+	srv, ln := wp.curServer, wp.curListener
+	wp.curServer, wp.curListener = nil, nil
+	wp.cfg.Enabled = false; c := wp.cfg
+	wp.mu.Unlock()
+	if srv != nil { _ = srv.Close() }
+	if ln != nil { _ = ln.Close() }
+	_ = savePanelConfig(wp.dataDir, c); wp.statsMgr.SetWebStatus(c.Port, false)
 }
 
 func (wp *WebPanelServer) listenOnPort(port int) error {
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp4", addr)
-	if err != nil {
-		return err
-	}
-	srv := &http.Server{
-		Handler:           wp.handler,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
+	if err != nil { return err }
+	srv := &http.Server{Handler: wp.handler, ReadHeaderTimeout: 10 * time.Second}
 	wp.mu.Lock()
-	oldLn := wp.curListener
-	oldSrv := wp.curServer
-	wp.curListener = ln
-	wp.curServer = srv
-	wp.cfg.Port = port
+	oldLn, oldSrv := wp.curListener, wp.curServer
+	wp.curListener, wp.curServer, wp.cfg.Port = ln, srv, port
 	wp.mu.Unlock()
-
-	wp.statsMgr.SetWebPort(port)
-
+	wp.statsMgr.SetWebStatus(port, true)
 	go func() {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("[WEB] Server error on %s: %v", addr, err)
-		}
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed { log.Printf("[WEB] %v", err) }
 	}()
-
 	if oldSrv != nil {
-		go func() {
-			time.Sleep(350 * time.Millisecond)
-			_ = oldSrv.Close()
-			if oldLn != nil {
-				_ = oldLn.Close()
-			}
-		}()
+		go func() { time.Sleep(350 * time.Millisecond); _ = oldSrv.Close(); if oldLn != nil { _ = oldLn.Close() } }()
 	}
-
 	return nil
 }
 
@@ -480,7 +471,7 @@ const webPanelHTML = `<!DOCTYPE html>
   \ \ /\ / /| | '_ \| |_) | |\/| |____\ \ / /| |_) |  \| |
    \ V  V / | | | | |  _ &lt;| |  | |_____\ V / |  __/| |\  |
     \_/\_/  |_|_| |_|_| \_\_|  |_|      \_/  |_|   |_| \_|</pre>
-    <div class="subtitle" id="subInfo">WinRM-VPN Server v0.4.2 | Панель управления</div>
+    <div class="subtitle" id="subInfo">WinRM-VPN Server v0.4.3 | Панель управления</div>
     <div><span class="status-pill"><span class="dot dot-off" id="vpnDot"></span><span id="vpnStatusText">Загрузка...</span></span></div>
     <div class="pin-bar"><span><b>Cert SHA-256 Pin:</b> <span id="certPinVal">—</span></span><button class="btn-sm" onclick="copyText(document.getElementById('certPinVal').textContent)">Копировать</button></div>
   </div>

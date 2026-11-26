@@ -53,6 +53,7 @@ type ServerStatsSnapshot struct {
 	PID              int            `json:"pid"`
 	ListenAddr       string         `json:"listen_addr"`
 	WebPort          int            `json:"web_port"`
+	WebEnabled       bool           `json:"web_enabled"`
 	HostName         string         `json:"host_name"`
 	CertPin          string         `json:"cert_pin"`
 	ExternalIP       string         `json:"external_ip"`
@@ -84,6 +85,7 @@ type StatsManager struct {
 	vpnRunning   bool
 	listenAddr   string
 	webPort      int
+	webEnabled   bool
 	hostName     string
 	certPin      string
 	externalIP   string
@@ -163,8 +165,13 @@ func (sm *StatsManager) SetMetadata(listenAddr, hostName, certPin, extIP string,
 }
 
 func (sm *StatsManager) SetWebPort(port int) {
+	sm.SetWebStatus(port, sm.webEnabled)
+}
+
+func (sm *StatsManager) SetWebStatus(port int, enabled bool) {
 	sm.mu.Lock()
-	sm.webPort = port
+	if port > 0 { sm.webPort = port }
+	sm.webEnabled = enabled
 	sm.mu.Unlock()
 }
 
@@ -639,6 +646,7 @@ func (sm *StatsManager) Snapshot() ServerStatsSnapshot {
 		PID:              os.Getpid(),
 		ListenAddr:       sm.listenAddr,
 		WebPort:          sm.webPort,
+		WebEnabled:       sm.webEnabled,
 		HostName:         sm.hostName,
 		CertPin:          sm.certPin,
 		ExternalIP:       sm.externalIP,
@@ -688,7 +696,7 @@ func (sm *StatsManager) FlushAndClose() {
 	_ = os.Remove(sm.sockPath)
 }
 
-func (sm *StatsManager) StartControlSocket(vpnEngine *VPNEngine, onShutdown func()) error {
+func (sm *StatsManager) StartControlSocket(vpnEngine *VPNEngine, webPanel *WebPanelServer, onShutdown func()) error {
 	_ = os.Remove(sm.sockPath)
 	ln, err := net.Listen("unix", sm.sockPath)
 	if err != nil {
@@ -733,6 +741,16 @@ func (sm *StatsManager) StartControlSocket(vpnEngine *VPNEngine, onShutdown func
 			}
 		}
 		_, _ = w.Write([]byte("RESTARTED\n"))
+	})
+	mux.HandleFunc("/web/start", func(w http.ResponseWriter, r *http.Request) {
+		if webPanel != nil {
+			if err := webPanel.Start(); err != nil { http.Error(w, err.Error(), 500); return }
+		}
+		_, _ = w.Write([]byte("OK\n"))
+	})
+	mux.HandleFunc("/web/stop", func(w http.ResponseWriter, r *http.Request) {
+		if webPanel != nil { webPanel.Stop() }
+		_, _ = w.Write([]byte("OK\n"))
 	})
 	mux.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -884,6 +902,7 @@ func loadOfflineUsersSnapshot(dataDir string) ServerStatsSnapshot {
 		Version:    AppVersion,
 		Running:    false,
 		WebPort:    panelCfg.Port,
+		WebEnabled: panelCfg.Enabled,
 		TotalUsers: len(users),
 		Users:      users,
 	}
