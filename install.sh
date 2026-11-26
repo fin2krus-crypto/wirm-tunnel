@@ -11,7 +11,7 @@ SERVICE_FILE="/etc/systemd/system/winrm-vpn.service"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-echo -e "${CYAN}=== WinRM-VPN Server v0.4.3 — Автоустановка (Debian 12 / 13) ===${NC}"
+echo -e "${CYAN}=== WinRM-VPN Server v0.4.4 — Автоустановка (Debian 12 / 13) ===${NC}"
 [[ "${EUID}" -ne 0 ]] && echo -e "${RED}[ОШИБКА] Запустите от root.${NC}" && exit 1
 [[ ! -f /etc/os-release ]] && echo -e "${RED}[ОШИБКА] Нет /etc/os-release.${NC}" && exit 1
 source /etc/os-release
@@ -48,7 +48,7 @@ fi
 
 cat << EOF > "${SERVICE_FILE}"
 [Unit]
-Description=WinRM-VPN Server v0.4.3
+Description=WinRM-VPN Server v0.4.4
 After=network-online.target
 Wants=network-online.target
 
@@ -74,12 +74,12 @@ systemctl is-active --quiet winrm-vpn || { journalctl -u winrm-vpn -n 30 --no-pa
 curl -sk --max-time 5 --tlsv1.3 --tls13-ciphers TLS_AES_256_GCM_SHA384 -X POST "https://127.0.0.1:${PORT}/wsman" \
     -H "Content-Type: application/soap+xml;charset=UTF-8" \
     -d '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"><s:Header/><s:Body><wsmid:Identify/></s:Body></s:Envelope>' | grep -q "Microsoft Corporation"
-curl -fsS --max-time 5 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -q "0.4.3"
+curl -fsS --max-time 5 "http://127.0.0.1:${WEB_PORT}/api/stats" | grep -q "0.4.4"
 
 CERT_PIN="$(openssl x509 -in "${CFG_DIR}/winrm_cert.pem" -outform DER | openssl dgst -sha256 | awk '{print $NF}')"
 SERVER_IP="$(curl -4 -fsS --max-time 5 https://ifconfig.io/ip 2>/dev/null || hostname -I | awk '{print $1}')"
 
-echo -e "\n${GREEN}УСТАНОВКА WINRM-VPN SERVER v0.4.3 ЗАВЕРШЕНА!${NC}"
+echo -e "\n${GREEN}УСТАНОВКА WINRM-VPN SERVER v0.4.4 ЗАВЕРШЕНА!${NC}"
 echo -e "  Веб-панель : ${CYAN}http://${SERVER_IP}:${WEB_PORT}${NC}"
 echo -e "  Server IP  : ${GREEN}${SERVER_IP}:${PORT}${NC}"
 echo -e "  PSK        : ${GREEN}${PSK}${NC}"

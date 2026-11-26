@@ -15,6 +15,12 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
+import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.drawable.Drawable
+import android.widget.ImageButton
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -96,7 +102,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.4.2  |  Should looks like Ansible"
+            text = "v0.4.4  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -104,12 +110,14 @@ __        ___       ____  __  __    __     ______  _   _
             setPadding(0, 0, 0, 24)
         }
 
+        val serverRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         serverInput = EditText(this).apply {
             hint = "Server IP:Port (e.g. 203.0.113.10:5986)"
             setText(prefs.getString("server", ""))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#78909C"))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
+        serverRow.addView(serverInput); serverRow.addView(createClipboardPasteButton { pasteFromClipboard(serverInput) })
         val pskRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         pskInput = EditText(this).apply {
             hint = "Pre-Shared Key (PSK)"
@@ -117,7 +125,7 @@ __        ___       ____  __  __    __     ______  _   _
             setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#78909C"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        pskRow.addView(pskInput); pskRow.addView(createSmallPasteButton { pasteFromClipboard(pskInput) })
+        pskRow.addView(pskInput); pskRow.addView(createClipboardPasteButton { pasteFromClipboard(pskInput) })
 
         val pinRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         pinInput = EditText(this).apply {
@@ -126,7 +134,7 @@ __        ___       ____  __  __    __     ______  _   _
             setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#78909C"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        pinRow.addView(pinInput); pinRow.addView(createSmallPasteButton { pasteFromClipboard(pinInput) })
+        pinRow.addView(pinInput); pinRow.addView(createClipboardPasteButton { pasteFromClipboard(pinInput) })
 
         val checkRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -324,7 +332,7 @@ __        ___       ____  __  __    __     ______  _   _
 
         layout.addView(logoView)
         layout.addView(versionView)
-        layout.addView(serverInput)
+        layout.addView(serverRow)
         layout.addView(pskRow)
         layout.addView(pinRow)
         layout.addView(checkRow)
@@ -347,11 +355,30 @@ __        ___       ____  __  __    __     ______  _   _
         logScroll.post { logScroll.scrollTo(0, logText.bottom) }
     }
 
-    private fun createSmallPasteButton(onClick: () -> Unit): Button {
-        return Button(this).apply {
-            text = "Вставить"; textSize = 11f
-            minWidth = 0; minHeight = 0; minimumWidth = 0; minimumHeight = 0
-            setPadding(22, 14, 22, 14)
+    private fun createClipboardPasteButton(onClick: () -> Unit): ImageButton {
+        val sizePx = (22 * resources.displayMetrics.density).toInt().coerceAtLeast(32)
+        val icon = object : Drawable() {
+            private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#CFD8DC"); style = Paint.Style.STROKE
+                strokeWidth = (2.0f * resources.displayMetrics.density).coerceAtLeast(3f)
+                strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+            }
+            override fun getIntrinsicWidth(): Int = sizePx
+            override fun getIntrinsicHeight(): Int = sizePx
+            override fun draw(c: Canvas) {
+                val sx = bounds.width() / 24f; val sy = bounds.height() / 24f
+                c.drawRoundRect(5f * sx, 4f * sy, 19f * sx, 21f * sy, 2f * sx, 2f * sy, p)
+                c.drawRoundRect(9f * sx, 2f * sy, 15f * sx, 5.5f * sy, 1f * sx, 1f * sy, p)
+                c.drawLine(8.5f * sx, 10.5f * sy, 15.5f * sx, 10.5f * sy, p)
+                c.drawLine(8.5f * sx, 14.5f * sy, 15.5f * sx, 14.5f * sy, p)
+            }
+            override fun setAlpha(alpha: Int) { p.alpha = alpha }
+            override fun setColorFilter(cf: ColorFilter?) { p.colorFilter = cf }
+            @Deprecated("Deprecated in Java") override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+        }
+        return ImageButton(this).apply {
+            setImageDrawable(icon); contentDescription = "Вставить"
+            setBackgroundColor(Color.parseColor("#21262D")); setPadding(22, 16, 22, 16)
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { leftMargin = 10 }
             setOnClickListener { onClick() }
         }
