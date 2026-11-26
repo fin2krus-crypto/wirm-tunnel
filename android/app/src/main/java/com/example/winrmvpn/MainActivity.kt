@@ -96,7 +96,7 @@ __        ___       ____  __  __    __     ______  _   _
         }
 
         val versionView = TextView(this).apply {
-            text = "v0.4.1  |  Should looks like Ansible"
+            text = "v0.4.2  |  Should looks like Ansible"
             typeface = Typeface.MONOSPACE
             textSize = 11f
             setTextColor(Color.parseColor("#90A4AE"))
@@ -110,40 +110,23 @@ __        ___       ____  __  __    __     ______  _   _
             setTextColor(Color.WHITE)
             setHintTextColor(Color.parseColor("#78909C"))
         }
-
-        val pskRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
+        val pskRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         pskInput = EditText(this).apply {
             hint = "Pre-Shared Key (PSK)"
             setText(prefs.getString("psk", ""))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#78909C"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val btnPastePsk = createSmallPasteButton {
-            pasteFromClipboard(pskInput)
-        }
-        pskRow.addView(pskInput)
-        pskRow.addView(btnPastePsk)
+        pskRow.addView(pskInput); pskRow.addView(createSmallPasteButton { pasteFromClipboard(pskInput) })
 
-        val pinRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
+        val pinRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         pinInput = EditText(this).apply {
             hint = "Cert SHA-256 Pin (64 hex, optional)"
             setText(prefs.getString("pin", ""))
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#78909C"))
+            setTextColor(Color.WHITE); setHintTextColor(Color.parseColor("#78909C"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val btnPastePin = createSmallPasteButton {
-            pasteFromClipboard(pinInput)
-        }
-        pinRow.addView(pinInput)
-        pinRow.addView(btnPastePin)
+        pinRow.addView(pinInput); pinRow.addView(createSmallPasteButton { pasteFromClipboard(pinInput) })
 
         val checkRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -330,6 +313,7 @@ __        ___       ____  __  __    __     ______  _   _
             addView(logText)
         }
 
+        // Гарантированный автоскролл вниз сразу после перерасчёта высоты текста
         logText.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
             if (bottom > oldBottom && autoScrollEnabled) {
                 logScroll.post {
@@ -365,19 +349,10 @@ __        ___       ____  __  __    __     ______  _   _
 
     private fun createSmallPasteButton(onClick: () -> Unit): Button {
         return Button(this).apply {
-            text = "Вставить"
-            textSize = 11f
-            minWidth = 0
-            minHeight = 0
-            minimumWidth = 0
-            minimumHeight = 0
+            text = "Вставить"; textSize = 11f
+            minWidth = 0; minHeight = 0; minimumWidth = 0; minimumHeight = 0
             setPadding(22, 14, 22, 14)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                leftMargin = 10
-            }
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { leftMargin = 10 }
             setOnClickListener { onClick() }
         }
     }
@@ -385,18 +360,9 @@ __        ___       ____  __  __    __     ______  _   _
     private fun pasteFromClipboard(target: EditText) {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = cm.primaryClip
-        if (!cm.hasPrimaryClip() || clip == null || clip.itemCount == 0) {
-            showValidationError("Буфер обмена пуст.")
-            return
-        }
-        val text = clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
-        if (text.isNullOrEmpty()) {
-            showValidationError("В буфере обмена нет текста.")
-            return
-        }
-        target.setText(text)
-        target.setSelection(text.length)
-        errorText.visibility = View.GONE
+        val text = if (cm.hasPrimaryClip() && clip != null && clip.itemCount > 0) clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim() else null
+        if (text.isNullOrEmpty()) { showValidationError("Буфер обмена пуст."); return }
+        target.setText(text); target.setSelection(text.length); errorText.visibility = View.GONE
     }
 
     override fun onDestroy() {

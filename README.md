@@ -1,4 +1,4 @@
-# WinRM-VPN (Server v0.4.1 / Clients v0.4.1)
+# WinRM-VPN (Server v0.4.2 / Clients v0.4.2)
 
 Стелс-VPN для тестирования DPI-систем с мимикрией под **Ansible (`pywinrm` / OpenSSL 3.x)** и **Windows Server 2022/2025 WinRM over HTTPS (`5986/TCP`)**.
 
@@ -12,7 +12,7 @@
 
     curl -fsSL https://raw.githubusercontent.com/n0nam4ik/wirm-tunnel/main/update.sh | sudo bash
 
-## Ключевые технологии (v0.4.1 / v0.4.1)
+## Ключевые технологии (v0.4.2 / v0.4.2)
 
 - **2-канальный WinRM HTTP/1.1 (Send + Receive):** канонический полудуплекс `POST /wsman -> 200 OK` на отправку + `Transfer-Encoding: chunked` с ротацией 55-85 сек на приём и плановой ротацией сокетов каждые 10-15 мин.
 - **Коалесирующий батчинг 3 мс и выравнивание под MSS:** склейка мелких пакетов/ACK и естественный SOAP-паддинг без лишних PSH,ACK.

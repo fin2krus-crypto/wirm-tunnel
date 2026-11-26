@@ -45,7 +45,7 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 	})
 
 	const nicID = tcpip.NICID(1)
-	linkEP := channel.New(512, 1380, "")
+	linkEP := channel.New(2048, 1380, "")
 
 	if err := s.CreateNIC(nicID, linkEP); err != nil {
 		cancel()
@@ -65,6 +65,10 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 	modBuf := tcpip.TCPModerateReceiveBufferOption(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modBuf)
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4194304}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4194304}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 
 	ns := &ClientNetstack{
 		s:      s,
@@ -74,31 +78,29 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 		onOut:  onOut,
 	}
 
-	// Асинхронный TCP-форвардер: net.DialTimeout НЕ блокирует InjectPacket и HTTP Send-канал
 	tcpFwd := tcp.NewForwarder(s, 0, 2048, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
-		go func(req *tcp.ForwarderRequest, target string) {
-			outConn, err := net.DialTimeout("tcp4", target, 8*time.Second)
-			if err != nil {
-				req.Complete(true)
-				return
-			}
+		outConn, err := net.DialTimeout("tcp4", dst, 10*time.Second)
+		if err != nil {
+			r.Complete(true)
+			return
+		}
 
-			var wq waiter.Queue
-			ep, tcpErr := req.CreateEndpoint(&wq)
-			if tcpErr != nil {
-				_ = outConn.Close()
-				req.Complete(true)
-				return
-			}
-			req.Complete(false)
+		var wq waiter.Queue
+		ep, tcpErr := r.CreateEndpoint(&wq)
+		if tcpErr != nil {
+			_ = outConn.Close()
+			r.Complete(true)
+			return
+		}
+		r.Complete(false)
 
-			inConn := gonet.NewTCPConn(&wq, ep)
+		inConn := gonet.NewTCPConn(&wq, ep)
+		go func() {
 			defer inConn.Close()
 			defer outConn.Close()
-
 			done := make(chan struct{}, 2)
 			go func() {
 				_, _ = io.Copy(outConn, inConn)
@@ -112,7 +114,7 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 			case <-done:
 			case <-ctx.Done():
 			}
-		}(r, dst)
+		}()
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
@@ -127,14 +129,15 @@ func NewClientNetstack(onOut func(pkt []byte) error) (*ClientNetstack, error) {
 		}
 		inConn := gonet.NewUDPConn(s, &wq, ep)
 
+		outConn, err := net.DialTimeout("udp4", dst, 5*time.Second)
+		if err != nil {
+			_ = inConn.Close()
+			return
+		}
+
 		go func() {
 			defer inConn.Close()
-			outConn, err := net.DialTimeout("udp4", dst, 5*time.Second)
-			if err != nil {
-				return
-			}
 			defer outConn.Close()
-
 			done := make(chan struct{}, 2)
 			go func() {
 				buf := make([]byte, 2048)

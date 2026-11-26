@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use openssl::ssl::{AlpnError, Ssl, SslAcceptor, SslFiletype, SslMethod, SslOptions, SslVersion};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::io::copy_bidirectional;
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_openssl::SslStream;
 
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(_) => return,
             };
             let _ = back_stream.set_nodelay(true);
-            let _ = copy_bidirectional(&mut tls_stream, &mut back_stream).await;
+            let _ = copy_bidirectional_with_sizes(&mut tls_stream, &mut back_stream, 65536, 65536).await;
         });
     }
 }

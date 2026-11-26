@@ -32,7 +32,7 @@ import (
 	"winrm-vpn/common"
 )
 
-const AppVersion = "0.4.1"
+const AppVersion = "0.4.2"
 
 //go:embed embedded/winrm-tls-front
 var embeddedTlsFrontBin []byte
@@ -137,7 +137,7 @@ func (sm *SessionManager) GetOrCreate(id [16]byte, psk string) (*ClientSession, 
 	sess := &ClientSession{
 		id:           id,
 		psk:          psk,
-		txCh:         make(chan []byte, 256),
+		txCh:         make(chan []byte, 1024),
 		keepAliveCh:  make(chan struct{}, 8),
 		doneCh:       make(chan struct{}),
 		lastActivity: time.Now(),
@@ -686,14 +686,14 @@ func handleReceiveChannel(conn net.Conn, br *bufio.Reader, sess *ClientSession, 
 				sess.Touch()
 
 			case firstPkt := <-sess.txCh:
-				pkts := make([][]byte, 1, 24)
+				pkts := make([][]byte, 1, 64)
 				pkts[0] = firstPkt
 				batchBytes := len(firstPkt)
 
 				// 3-мс коалесирующий батчер для заполнения полных MSS и устранения мелких PSH,ACK
-				coalesceTimer := time.NewTimer(3 * time.Millisecond)
+				coalesceTimer := time.NewTimer(1 * time.Millisecond)
 			drainLoop:
-				for len(pkts) < 24 && batchBytes < 32768 {
+				for len(pkts) < 64 && batchBytes < 65536 {
 					select {
 					case p := <-sess.txCh:
 						pkts = append(pkts, p)
@@ -747,28 +747,37 @@ func handleSendChannel(conn net.Conn, br *bufio.Reader, sess *ClientSession, psk
 			return
 		}
 
-		frameType, pkts, err := common.DecodeBatchFrame(req.Body)
-		_, _ = io.Copy(io.Discard, req.Body)
-		_ = req.Body.Close()
-		if err != nil {
-			writeHttpSys400(conn)
-			return
-		}
-
-		if frameType == common.FrameKeepAlive {
-			select {
-			case sess.keepAliveCh <- struct{}{}:
-			default:
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+			frameType, pkts, err := common.DecodeBatchFrame(req.Body)
+			if err != nil {
+				_ = conn.SetReadDeadline(time.Time{})
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				_, _ = io.Copy(io.Discard, req.Body)
+				_ = req.Body.Close()
+				writeHttpSys400(conn)
+				return
 			}
-		} else {
-			for _, pkt := range pkts {
-				if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
-					statsMgr.AddRx(psk, len(pkt))
-					sess.netstack.InjectPacket(pkt)
+			_ = conn.SetReadDeadline(time.Time{})
+
+			if frameType == common.FrameKeepAlive {
+				select {
+				case sess.keepAliveCh <- struct{}{}:
+				default:
+				}
+			} else {
+				for _, pkt := range pkts {
+					if len(pkt) >= 20 && (pkt[0]>>4) == 4 {
+						statsMgr.AddRx(psk, len(pkt))
+						sess.netstack.InjectPacket(pkt)
+					}
 				}
 			}
+			sess.Touch()
 		}
-		sess.Touch()
+		_ = req.Body.Close()
 
 		soapResp := common.BuildSoapSendResponseXML(req.Host)
 		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+

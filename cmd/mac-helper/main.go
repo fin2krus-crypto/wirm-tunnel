@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	AppVersion         = "0.4.1"
+	AppVersion         = "0.4.2"
 	maxConnectAttempts = 3
 	ctlMetaPath        = "/tmp/winrm-vpn-ctl.json"
 )
@@ -180,7 +180,7 @@ func main() {
 	_, _ = rand.Read(sessionID[:])
 
 	var utunFile *os.File
-	tunRxCh := make(chan []byte, 256)
+	tunRxCh := make(chan []byte, 1024)
 	defer func() {
 		if utunFile != nil {
 			_ = utunFile.Close()
@@ -670,79 +670,69 @@ func runDualChannelSession(
 		}
 	}()
 
+	// Канал 2: Send (Transfer-Encoding: chunked POST /wsman, ротация 55-85с / 20МБ + 1мс батчер)
 	go func() {
-		sendBatchHTTP := func(frame []byte) error {
-			hdr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: %d\r\n\r\n",
-				common.WinRMPath, serverAddr, common.WinRMUserAgent, len(frame))
-			full := make([]byte, len(hdr)+len(frame))
-			copy(full, hdr)
-			copy(full[len(hdr):], frame)
-
-			_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := sendU.Write(full); err != nil {
-				return err
-			}
-			_ = sendRaw.SetWriteDeadline(time.Time{})
-
-			_ = sendRaw.SetReadDeadline(time.Now().Add(10 * time.Second))
-			resp, err := http.ReadResponse(sendBR, nil)
-			if err != nil {
-				return err
-			}
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			_ = sendRaw.SetReadDeadline(time.Time{})
-			if resp.StatusCode != 200 {
-				return fmt.Errorf("send status %d", resp.StatusCode)
-			}
-			return nil
-		}
-
+		const maxSendChunkedBytes = 20 * 1024 * 1024
 		for {
 			select {
 			case <-sessionDone:
 				return
 			case <-stopCh:
 				return
-			case <-kaReqCh:
-				if err := sendBatchHTTP(common.EncodeBatchFrame(nil, common.FrameKeepAlive)); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-			case firstPkt := <-tunRxCh:
-				pkts := make([][]byte, 1, 24)
-				pkts[0] = firstPkt
-				batchBytes := len(firstPkt)
-
-				cTimer := time.NewTimer(3 * time.Millisecond)
-			drain:
-				for len(pkts) < 24 && batchBytes < 32768 {
-					select {
-					case p := <-tunRxCh:
-						pkts = append(pkts, p)
-						batchBytes += len(p)
-					case <-cTimer.C:
-						break drain
-					}
-				}
-				if !cTimer.Stop() {
-					select {
-					case <-cTimer.C:
-					default:
-					}
-				}
-
-				if err := sendBatchHTTP(common.EncodeBatchFrame(pkts, common.FrameData)); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
+			default:
 			}
+			hdr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nTransfer-Encoding: chunked\r\n\r\n",
+				common.WinRMPath, serverAddr, common.WinRMUserAgent)
+			_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(sendU, hdr); err != nil {
+				select { case errCh <- err: default: }
+				return
+			}
+			_ = sendRaw.SetWriteDeadline(time.Time{})
+			rolloverTimer := time.NewTimer(time.Duration(55+mathrand.Intn(31)) * time.Second)
+			sentBytes, rolloverNow := 0, false
+			for !rolloverNow {
+				select {
+				case <-sessionDone:
+					rolloverTimer.Stop(); return
+				case <-stopCh:
+					rolloverTimer.Stop(); return
+				case <-rolloverTimer.C:
+					rolloverNow = true
+				case <-kaReqCh:
+					frame := common.EncodeBatchFrame(nil, common.FrameKeepAlive)
+					_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					if err := common.WriteHTTPChunk(sendU, frame); err != nil {
+						rolloverTimer.Stop(); select { case errCh <- err: default: }; return
+					}
+					_ = sendRaw.SetWriteDeadline(time.Time{}); sentBytes += len(frame)
+				case firstPkt := <-tunRxCh:
+					pkts := make([][]byte, 1, 64); pkts[0] = firstPkt; batchBytes := len(firstPkt)
+					cTimer := time.NewTimer(1 * time.Millisecond)
+				drain:
+					for len(pkts) < 64 && batchBytes < 65536 {
+						select {
+						case p := <-tunRxCh: pkts = append(pkts, p); batchBytes += len(p)
+						case <-cTimer.C: break drain
+						}
+					}
+					if !cTimer.Stop() { select { case <-cTimer.C: default: } }
+					frame := common.EncodeBatchFrame(pkts, common.FrameData)
+					_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					if err := common.WriteHTTPChunk(sendU, frame); err != nil {
+						rolloverTimer.Stop(); select { case errCh <- err: default: }; return
+					}
+					_ = sendRaw.SetWriteDeadline(time.Time{}); sentBytes += len(frame)
+				}
+				if sentBytes >= maxSendChunkedBytes { rolloverTimer.Stop(); rolloverNow = true }
+			}
+			_ = sendRaw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.WriteString(sendU, "0\r\n\r\n"); err != nil { select { case errCh <- err: default: }; return }
+			_ = sendRaw.SetWriteDeadline(time.Time{}); _ = sendRaw.SetReadDeadline(time.Now().Add(10 * time.Second))
+			resp, err := http.ReadResponse(sendBR, nil)
+			if err != nil { select { case errCh <- err: default: }; return }
+			_, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close(); _ = sendRaw.SetReadDeadline(time.Time{})
+			if resp.StatusCode != 200 { select { case errCh <- fmt.Errorf("send %d", resp.StatusCode): default: }; return }
 		}
 	}()
 
